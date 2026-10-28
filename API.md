@@ -1,0 +1,677 @@
+# Onion Forecasting Intelligence — API Documentation
+
+This document covers all API endpoints, parameters, request headers, service logic, and response schemas implemented across the codebase (`main.py`, `history_store.py`, and `upag_client.py`).
+
+---
+
+## Quick Reference & Base URL
+
+- **Base URL**: `http://127.0.0.1:8000`
+- **Interactive Swagger Docs**: `http://127.0.0.1:8000/docs`
+- **ReDoc**: `http://127.0.0.1:8000/redoc`
+- **Authentication**: All `/api/*` routes except CSV import require `Authorization: Bearer <API_BEARER_TOKEN>`.
+- **Model Engine**: Amazon Chronos-2 (`amazon/chronos-2`) probabilistic zero-shot time-series model
+- **Database**: SQLite (`data/onion_forecasting_v4.sqlite3`)
+- **Key Units**:
+  - Observation prices in SQLite: ₹ / metric quintal
+  - Forecast prices in API & persistence: ₹ / kg (converted automatically: divide by 100)
+  - Historical prices returned in graphs: ₹ / kg (converted for direct comparison with forecasts)
+  - Quantities (Arrival, Production, Consumption, Supply): Metric quintals / day
+
+Protected data and forecast routes require `Authorization: Bearer <API_BEARER_TOKEN>`.
+Configure `API_BEARER_TOKEN` in the API server's `.env`; keep the value in a trusted
+server-side secret store rather than frontend browser code. The CSV import route uses
+its separate `X-Ingestion-Key`, while `/`, `/health`, and CORS preflight `OPTIONS`
+requests do not require the bearer token.
+
+---
+
+## 1. Core Forecasting Graph APIs
+
+These endpoints execute Chronos-2 predictions on historical market data and automatically persist forecast runs and quantile values to SQLite.
+
+All three graph endpoints require `start_date` and `end_date` in `YYYY-MM-DD` format.
+Actual observations and forecast records are returned only inside this inclusive date
+range. The model forecasts from the day after the latest stored observation through
+`end_date`, using the full stored history as context. The end date must be after the
+latest observation and no more than 180 days after it. `horizon_days` is calculated as
+the number of days from the latest observation through `end_date`; it appears in the
+response and is not a request parameter. A graph request runs the forecast and saves
+it to SQLite. Identical predictions may be reused from the API's in-memory cache.
+`start_date` must be on or before `end_date`.
+
+### 1.1 Graph 1: Andhra Pradesh (AP) Price Forecast
+*Endpoint for predicting retail, wholesale, and mandi modal onion prices for Andhra Pradesh.*
+
+- **Method**: `GET`
+- **Path**: `/api/graphs/ap-retail`
+- **Description**: Returns historical observations and future forecasts for Andhra Pradesh. Retail price forecasts use multivariate covariates (wholesale and mandi modal prices as covariates forecast beforehand). Wholesale and mandi modal prices are forecast as univariate series.
+
+#### Query Parameters:
+| Parameter | Type | Required | Default | Allowed Values / Constraints | Description |
+|---|---|---|---|---|---|
+| `price_types` | string | No | `retail` | Comma-separated: `retail`, `wholesale`, `mandi_modal` | Price series to include. Case-insensitive. |
+| `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
+| `end_date` | date | Yes | — | `YYYY-MM-DD`, after and at most 180 days after latest observation | Last date to display; the model forecasts through this date. |
+| `threshold_rs_kg` | number | No | `44.0` | Greater than or equal to `0` | Chart reference threshold in INR/kg; echoed in the response. |
+
+#### Target & Covariate Logic:
+- **`retail`**: Context uses Date + AP Retail + AP Wholesale + AP Mandi Modal. Future wholesale and mandi modal values are independently forecast first, then supplied as known future covariates.
+- **`wholesale`**: Context uses Date + AP Wholesale only.
+- **`mandi_modal`**: Context uses Date + AP Mandi Modal only.
+
+#### Example Request:
+```http
+GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=2026-10-01&end_date=2026-11-30&threshold_rs_kg=44
+```
+
+#### Sample Output:
+```json
+{
+  "graph": "ap_price_forecast",
+  "title": "Andhra Pradesh Onion Price Forecast",
+  "state": "AP",
+  "state_name": "Andhra Pradesh",
+  "price_types": ["retail", "wholesale", "mandi_modal"],
+  "unit": "INR/kg",
+  "threshold_rs_kg": 44.0,
+  "horizon_days": 46,
+  "model_history_rows": 1760,
+  "visible_start_date": "2026-10-01",
+  "visible_end_date": "2026-11-30",
+  "context_logic": {
+    "retail": ["timestamp", "AP_retail_rs_per_metric_quintal", "AP_wholesale_rs_per_metric_quintal", "AP_mandi_modal_rs_per_metric_quintal"],
+    "wholesale": ["timestamp", "AP_wholesale_rs_per_metric_quintal"],
+    "mandi_modal": ["timestamp", "AP_mandi_modal_rs_per_metric_quintal"]
+  },
+  "historical": [
+    {
+      "date": "2026-10-01",
+      "state": "AP",
+      "price_type": "retail",
+      "price_type_label": "Retail price",
+      "actual_price_rs_kg": 32.50
+    }
+  ],
+  "forecast": [
+    {
+      "date": "2026-10-16",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "price_type": "retail",
+      "price_type_label": "Retail price",
+      "latest_actual_date": "2026-10-15",
+      "latest_actual_price_rs_kg": 32.50,
+      "predicted_price_rs_kg": 34.20,
+      "change_rs_kg": 1.70,
+      "change_percent": 5.23,
+      "change_direction": "increase",
+      "p10_rs_kg": 30.10,
+      "p50_rs_kg": 34.20,
+      "p90_rs_kg": 38.80,
+      "prediction_interval_width_rs_kg": 8.70,
+      "interval_width_pct_of_median": 25.44
+    }
+  ],
+  "metadata": {
+    "model": "amazon/chronos-2",
+    "frequency": "daily",
+    "observation_price_unit": "INR/metric quintal",
+    "forecast_price_unit": "INR/kg",
+    "quantity_unit": "metric quintals/day (source period needs validation)",
+    "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
+    "prediction_interval": {
+      "nominal_coverage": 0.8,
+      "description": "P10–P90 is a nominal central 80% prediction interval, not a guarantee."
+    },
+    "confidence_score": {
+      "available": false,
+      "reason": "Chronos-2 returns forecast quantiles, not a native calibrated scalar confidence score."
+    }
+  },
+  "saved_to_sqlite": {
+    "run_id": 1,
+    "generated_at": "2026-10-27T18:00:00Z",
+    "saved_values": 138,
+    "graph_code": "graph1_ap_prices"
+  },
+  "last_observation_date": "2026-10-15",
+  "data_staleness_days": 12,
+  "forecast_start_date": "2026-10-16",
+  "forecast_end_date": "2026-11-30",
+  "warnings": [
+    "Latest observation is 2026-10-15 (12 day(s) behind the server date)."
+  ]
+}
+```
+
+---
+
+### 1.2 Graph 2: Multi-State Price Comparison
+*Endpoint for comparing onion prices across key producing and consuming states.*
+
+- **Method**: `GET`
+- **Path**: `/api/graphs/state-comparison`
+- **Description**: Compares onion prices across any combination of supported states (`AP`, `KA`, `MH`, `MP`) and price types.
+
+#### Query Parameters:
+| Parameter | Type | Required | Default | Allowed Values / Constraints | Description |
+|---|---|---|---|---|---|
+| `states` | string | No | `AP,KA,MH,MP` | Comma-separated: `AP`, `KA`, `MH`, `MP` | States to forecast and compare. |
+| `price_types` | string | No | `retail,wholesale,mandi_modal` | Comma-separated: `retail`, `wholesale`, `mandi_modal` | Price types to include. |
+| `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
+| `end_date` | date | Yes | — | `YYYY-MM-DD`, after and at most 180 days after latest observation | Last date to display; the model forecasts through this date. |
+| `threshold_rs_kg` | number | No | `44.0` | Greater than or equal to `0` | Chart reference threshold in INR/kg; echoed in the response. |
+
+#### Example Request:
+```http
+GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start_date=2026-10-01&end_date=2026-11-30&threshold_rs_kg=44
+```
+
+#### Sample Output:
+```json
+{
+  "graph": "state_price_comparison",
+  "title": "Selected States — Onion Price Forecasts",
+  "selected_states": ["AP", "MH"],
+  "selected_state_names": ["Andhra Pradesh", "Maharashtra"],
+  "selected_price_types": ["retail", "wholesale"],
+  "horizon_days": 46,
+  "unit": "INR/kg",
+  "threshold_rs_kg": 44.0,
+  "historical": [
+    {
+      "date": "2026-10-01",
+      "state": "MH",
+      "price_type": "wholesale",
+      "price_type_label": "Wholesale price",
+      "actual_price_rs_kg": 24.10
+    }
+  ],
+  "forecast": [
+    {
+      "date": "2026-10-16",
+      "state": "MH",
+      "state_name": "Maharashtra",
+      "price_type": "wholesale",
+      "price_type_label": "Wholesale price",
+      "latest_actual_date": "2026-10-15",
+      "latest_actual_price_rs_kg": 24.10,
+      "predicted_price_rs_kg": 26.50,
+      "change_rs_kg": 2.40,
+      "change_percent": 9.96,
+      "change_direction": "increase",
+      "p10_rs_kg": 23.20,
+      "p50_rs_kg": 26.50,
+      "p90_rs_kg": 30.10,
+      "prediction_interval_width_rs_kg": 6.90,
+      "interval_width_pct_of_median": 26.04
+    }
+  ],
+  "metadata": {
+    "model": "amazon/chronos-2",
+    "frequency": "daily",
+    "observation_price_unit": "INR/metric quintal",
+    "forecast_price_unit": "INR/kg",
+    "quantity_unit": "metric quintals/day (source period needs validation)",
+    "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
+    "prediction_interval": {
+      "nominal_coverage": 0.8,
+      "description": "P10–P90 is a nominal central 80% prediction interval, not a guarantee."
+    },
+    "confidence_score": {
+      "available": false,
+      "reason": "Chronos-2 returns forecast quantiles, not a native calibrated scalar confidence score."
+    }
+  },
+  "saved_to_sqlite": {
+    "run_id": 2,
+    "generated_at": "2026-10-27T18:05:00Z",
+    "saved_values": 184,
+    "graph_code": "graph2_state_comparison"
+  },
+  "last_observation_date": "2026-10-15",
+  "data_staleness_days": 12,
+  "forecast_start_date": "2026-10-16",
+  "forecast_end_date": "2026-11-30",
+  "warnings": [
+    "Latest observation is 2026-10-15 (12 day(s) behind the server date)."
+  ]
+}
+```
+
+---
+
+### 1.3 Graph 3: Supply, Consumption & Balance (Shortfall) Forecast
+*Endpoint for predicting quantity flows and estimated surplus / deficit.*
+
+- **Method**: `GET`
+- **Path**: `/api/graphs/supply-balance`
+- **Description**: Forecasts `supply`, `consumption`, `arrival`, and `production` as independent univariate targets for each selected state. Returns their P10/P50/P90 forecasts in `quantity_forecast` and calculates shortfall as `supply - consumption` with conservative component bounds.
+
+#### Query Parameters:
+| Parameter | Type | Required | Default | Allowed Values / Constraints | Description |
+|---|---|---|---|---|---|
+| `states` | string | No | `AP` | Comma-separated: `AP`, `KA`, `MH`, `MP` | States to calculate balance for. |
+| `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
+| `end_date` | date | Yes | — | `YYYY-MM-DD`, after and at most 180 days after latest observation | Last date to display; the model forecasts through this date. |
+
+#### Formula & Logic:
+- **Supply**: The historical supply series is calculated as `arrival + production` and forecast as its own univariate target. Its forecast is independent of the separately forecast arrival and production series; the API does not calculate forecast supply by summing their forecast values.
+- **Consumption**: Historical daily consumption, forecast as a univariate series.
+- **Arrival**: Historical arrival values, forecast as a separate univariate target.
+- **Production**: Historical production values, forecast as a separate univariate target.
+- **Forecast response**: `quantity_forecast` contains one row per date, selected state, and metric. `metric` is `supply`, `consumption`, `arrival`, or `production`. Each row includes P10/P50/P90 fields and `predicted_quantity_mq_day`.
+- **Historical response**: `historical` uses the same metric labels and includes actual values for supply, consumption, arrival, and production.
+- **Shortfall Formula**: `Shortfall = Supply - Consumption`
+  - $P_{50} = \text{Supply } P_{50} - \text{Consumption } P_{50}$
+  - $P_{10} = \text{Supply } P_{10} - \text{Consumption } P_{90}$ (conservative lower bound)
+  - $P_{90} = \text{Supply } P_{90} - \text{Consumption } P_{10}$ (conservative upper bound)
+  - **Classification**: `potential_surplus` (if $P_{50} > 0$), `potential_shortfall` (if $P_{50} < 0$), or `near_balance` (if $P_{50} = 0$).
+
+#### Example Request:
+```http
+GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-30
+```
+
+#### Sample Output:
+```json
+{
+  "graph": "supply_demand_shortfall",
+  "title": "Onion Supply, Consumption and Shortfall Forecast",
+  "selected_states": ["AP"],
+  "selected_state_names": ["Andhra Pradesh"],
+  "horizon_days": 46,
+  "quantity_unit": "metric_quintal/day",
+  "historical": [
+    {
+      "date": "2026-10-01",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "supply",
+      "actual_quantity_mq_day": 4520.0,
+      "unit": "metric_quintal/day"
+    }
+  ],
+  "quantity_forecast": [
+    {
+      "date": "2026-10-16",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "supply",
+      "predicted_quantity_mq_day": 4350.25,
+      "p10_mq_day": 3900.0,
+      "p50_mq_day": 4350.25,
+      "p90_mq_day": 4800.5,
+      "unit": "metric_quintal/day"
+    },
+    {
+      "date": "2026-10-16",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "consumption",
+      "predicted_quantity_mq_day": 4600.0,
+      "p10_mq_day": 4400.0,
+      "p50_mq_day": 4600.0,
+      "p90_mq_day": 4850.0,
+      "unit": "metric_quintal/day"
+    },
+    {
+      "date": "2026-10-16",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "arrival",
+      "predicted_quantity_mq_day": 1200.0,
+      "p10_mq_day": 1100.0,
+      "p50_mq_day": 1200.0,
+      "p90_mq_day": 1300.0,
+      "unit": "metric_quintal/day"
+    },
+    {
+      "date": "2026-10-16",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "production",
+      "predicted_quantity_mq_day": 3320.0,
+      "p10_mq_day": 3200.0,
+      "p50_mq_day": 3320.0,
+      "p90_mq_day": 3450.0,
+      "unit": "metric_quintal/day"
+    }
+  ],
+  "balance_forecast": [
+    {
+      "date": "2026-10-16",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "shortfall_p10_metric_quintal_day": -950.0,
+      "shortfall_p50_metric_quintal_day": -249.75,
+      "shortfall_p90_metric_quintal_day": 400.5,
+      "classification": "potential_shortfall"
+    }
+  ],
+  "balance_formula": "supply - consumption",
+  "metadata": {
+    "model": "amazon/chronos-2",
+    "frequency": "daily",
+    "observation_price_unit": "INR/metric quintal",
+    "forecast_price_unit": "INR/kg",
+    "quantity_unit": "metric quintals/day (source period needs validation)",
+    "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
+    "prediction_interval": {
+      "nominal_coverage": 0.8,
+      "description": "P10–P90 is a nominal central 80% prediction interval, not a guarantee."
+    },
+    "confidence_score": {
+      "available": false,
+      "reason": "Chronos-2 returns forecast quantiles, not a native calibrated scalar confidence score."
+    }
+  },
+  "warnings": [
+    "Latest observation is 2026-10-15 (12 day(s) behind the server date).",
+    "Supply is calculated as arrivals + production as requested; confirm that arrivals and production are compatible flows and do not double-count the same supply.",
+    "The source production/consumption series repeat across many daily rows; verify their real reporting frequency before interpreting daily forecasts.",
+    "Shortfall is supply minus consumption: negative values indicate demand exceeds supply; positive values indicate surplus.",
+    "Shortfall P10/P90 combine component quantiles conservatively and are not a calibrated joint prediction interval."
+  ],
+  "saved_to_sqlite": {
+    "run_id": 3,
+    "generated_at": "2026-10-27T18:10:00Z",
+    "saved_values": 230,
+    "graph_code": "graph3_supply_balance"
+  },
+  "last_observation_date": "2026-10-15",
+  "data_staleness_days": 12,
+  "forecast_start_date": "2026-10-16",
+  "forecast_end_date": "2026-11-30"
+}
+```
+
+---
+
+## 2. Forecast Persistence & Run History APIs
+
+Every forecast generated by the graph endpoints is automatically stored in SQLite. These endpoints allow querying stored runs.
+
+### 2.1 Get Latest Saved Forecast
+- **Method**: `GET`
+- **Path**: `/api/forecasts/latest`
+- **Description**: Returns the latest forecast run and its detailed predicted quantile values.
+
+#### Query Parameters:
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `graph_code` | string | No | `null` | Optional filter: `graph1_ap_prices`, `graph2_state_comparison`, or `graph3_supply_balance`. If omitted, returns the latest run across all graphs. |
+
+#### Sample Output:
+```json
+{
+  "forecast": {
+    "run_id": 12,
+    "graph_code": "graph1_ap_prices",
+    "generated_at": "2026-10-27T17:45:10Z",
+    "model_id": "amazon/chronos-2",
+    "horizon_days": 14,
+    "last_observation_date": "2026-10-15",
+    "context_hash": "a1b2c3d4e5f6789012345678",
+    "metadata": {
+      "stored_forecast_price_unit": "INR/kg",
+      "observation_price_unit": "INR/metric quintal",
+      "quantiles": [0.1, 0.5, 0.9]
+    },
+    "forecast_values": [
+      {
+        "state_code": "AP",
+        "target_key": "retail",
+        "forecast_date": "2026-10-16",
+        "p10": 30.12,
+        "p50": 34.50,
+        "p90": 39.20,
+        "unit": "INR/kg"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 2.2 List Recent Forecast Runs
+- **Method**: `GET`
+- **Path**: `/api/forecasts/runs`
+- **Description**: Returns a summary list of past forecast runs (without expanding individual value rows).
+
+#### Query Parameters:
+| Parameter | Type | Required | Default | Allowed Values | Description |
+|---|---|---|---|---|---|
+| `limit` | integer | No | `20` | `1` to `100` | Number of recent runs to return. |
+
+#### Sample Output:
+```json
+{
+  "runs": [
+    {
+      "run_id": 12,
+      "graph_code": "graph1_ap_prices",
+      "generated_at": "2026-10-27T17:45:10Z",
+      "model_id": "amazon/chronos-2",
+      "horizon_days": 14,
+      "last_observation_date": "2026-10-15",
+      "context_hash": "a1b2c3d4e5f6789012345678"
+    },
+    {
+      "run_id": 11,
+      "graph_code": "graph3_supply_balance",
+      "generated_at": "2026-10-27T17:30:22Z",
+      "model_id": "amazon/chronos-2",
+      "horizon_days": 30,
+      "last_observation_date": "2026-10-15",
+      "context_hash": "b2c3d4e5f6a1789012345678"
+    }
+  ]
+}
+```
+
+---
+
+## 3. Data Health, Staleness & Ingestion APIs
+
+These endpoints provide observability into the underlying SQLite database, observation freshness, and dataset synchronization.
+
+### 3.1 Service Root
+- **Method**: `GET`
+- **Path**: `/`
+- **Description**: Entrypoint providing API service information, links to Swagger UI docs, and sample graph endpoints.
+
+#### Sample Output:
+The graph values below are bare paths; add the required `start_date` and `end_date`
+parameters (and any optional filters) when calling a graph endpoint.
+
+```json
+{
+  "service": "Onion Forecasting MVP API v3",
+  "docs": "/docs",
+  "graphs": {
+    "graph_1_ap_prices": "/api/graphs/ap-retail",
+    "graph_2_state_comparison": "/api/graphs/state-comparison",
+    "graph_3_supply_balance": "/api/graphs/supply-balance"
+  },
+  "ops": {
+    "health": "/health",
+    "ingestion_status": "/api/ingestion/status",
+    "saved_forecasts": "/api/forecasts/latest"
+  }
+}
+```
+
+---
+
+### 3.2 Health Check
+- **Method**: `GET`
+- **Path**: `/health`
+- **Description**: Verifies API operational status, SQLite connection, whether Chronos-2 pipeline is loaded in memory, and dataset staleness relative to system clock.
+
+#### Sample Output:
+```json
+{
+  "status": "ok",
+  "model_loaded": true,
+  "model_id": "amazon/chronos-2",
+  "history_db": "c:\\Users\\user\\Desktop\\Onion-Forecasting-Intelligence\\data\\onion_forecasting_v4.sqlite3",
+  "ingestion": {
+    "database_path": "c:\\Users\\user\\Desktop\\Onion-Forecasting-Intelligence\\data\\onion_forecasting_v4.sqlite3",
+    "observation_rows": 1760,
+    "first_observation_date": "2022-01-01",
+    "last_observation_date": "2026-10-15",
+    "forecast_run_count": 12,
+    "last_ingestion": {
+      "id": 1,
+      "checked_at": "2026-10-27T10:00:00Z",
+      "source": "initial_csv_seed",
+      "status": "success",
+      "rows_seen": 1760,
+      "inserted": 1760,
+      "updated": 0,
+      "unchanged": 0,
+      "latest_observation_date": "2026-10-15",
+      "message": null
+    }
+  },
+  "last_observation_date": "2026-10-15",
+  "data_staleness_days": 12,
+  "forecast_start_date": "2026-10-16",
+  "warnings": [
+    "Latest observation is 2026-10-15 (12 day(s) behind the server date)."
+  ]
+}
+```
+
+---
+
+### 3.3 Data Status
+- **Method**: `GET`
+- **Path**: `/api/data/status`
+- **Description**: Lightweight overview of observation freshness, staleness warning, and last sync summary.
+
+#### Response Shape:
+Returns `ingestion` (the same object as `/api/ingestion/status`) plus
+`last_observation_date`, `data_staleness_days`, `forecast_start_date`, and `warnings`.
+
+---
+
+### 3.4 Ingestion Status
+- **Method**: `GET`
+- **Path**: `/api/ingestion/status`
+- **Description**: Returns database statistics including total observation rows, date span, total forecast runs, and the latest ingestion audit log.
+
+#### Response Shape:
+`database_path`, `observation_rows`, `first_observation_date`,
+`last_observation_date`, `forecast_run_count`, and `last_ingestion` (an ingestion-log
+object with `id`, `checked_at`, `source`, `status`, `rows_seen`, `inserted`,
+`updated`, `unchanged`, `latest_observation_date`, and `message`, or `null`).
+
+---
+
+### 3.5 Sync / Import Model-Ready CSV
+- **Method**: `POST`
+- **Path**: `/api/ingestion/sync-csv`
+- **Description**: Performs a timestamp-based upsert of a combined model-ready CSV located inside the `data/` directory into the SQLite database. Invalidates the prediction cache. Protected by an API key header.
+
+#### Headers:
+| Header | Type | Required | Description |
+|---|---|---|---|
+| `X-Ingestion-Key` | string | **Yes** | Secret token matching `INGESTION_API_KEY` defined in `.env`. |
+
+#### Query Parameters:
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `filename` | string | **Yes** | Name of the CSV file inside `data/` (e.g. `Onion_Model_Ready_Dataset_Chronos2.csv`). Cannot contain directory traversal paths. |
+
+#### Sample Request:
+```http
+POST /api/ingestion/sync-csv?filename=Onion_Model_Ready_Dataset_Chronos2_2026-10-26_Interpolated_Metric_Quintal.csv
+X-Ingestion-Key: your-secret-key-here
+```
+
+#### Sample Output:
+```json
+{
+  "status": "success",
+  "source": "csv_import:Onion_Model_Ready_Dataset_Chronos2_2026-10-26_Interpolated_Metric_Quintal.csv",
+  "rows_seen": 1760,
+  "inserted": 0,
+  "updated": 15,
+  "unchanged": 1745,
+  "latest_observation_date": "2026-10-15",
+  "history": {
+    "database_path": "c:\\...\\data\\onion_forecasting_v4.sqlite3",
+    "observation_rows": 1760,
+    "first_observation_date": "2022-01-01",
+    "last_observation_date": "2026-10-15",
+    "forecast_run_count": 12
+  }
+}
+```
+
+---
+
+## 4. External Data Integration Service: UPAg Client (`upag_client.py`)
+
+This service integrates with the government **UPAg (Unified Portal for Agricultural Statistics)** Open API at `https://data.upag.gov.in`. It securely manages authentication and raw source extraction without altering schema.
+
+### Endpoints Consumed:
+| Method | UPAg Path | Service Function | Description |
+|---|---|---|---|
+| `POST` | `/v1/upag/api-data-share/login` | `UPAgClient.login()` | Authenticates using credentials in `.env` (`UPAG_USERNAME`, `UPAG_PASSWORD`, `UPAG_CLIENT_ID`, `UPAG_CLIENT_SECRET`) via OAuth2 password grant to acquire a Bearer token. |
+| `GET` | `/v1/upag/api-data-share/sources/user-allowed-sources` | `UPAgClient.allowed_sources()` | Returns the list of datasets/sources authorized for the account. |
+| `POST` | `/v1/upag/api-data-share/sources/{source_name}` | `UPAgClient.fetch_source(source_name, payload)` | Queries a specific allowed source with a user-supplied JSON filter object. |
+
+### Allowed Sources Supported:
+`agmarknet`, `dafw_state`, `dafw_district`, `doca`, `enam`, `horticulture`, `fci_procurement`, `fci_stock`, `mncfc`, `ieg`, `dcs`, `dgcis`, `farmers_survey`, `nsso`, `cwwg`, `pmfby_ay`, `trs`, `state_reported`, `sopa`, `wpi`, `ncdex`, `pink_sheet`.
+
+### CLI Service Usage:
+```powershell
+# 1. List sources allowed for your account:
+python upag_client.py --list-sources
+
+# 2. Fetch raw source data using a JSON payload file:
+python upag_client.py --source agmarknet --payload-file payload.json --output data/raw_agmarknet.json
+```
+
+---
+
+## 5. Summary of Error Codes & HTTP Statuses
+
+### Bearer authentication for remote frontends
+
+Every `/api/*` route except `POST /api/ingestion/sync-csv` requires a bearer token. Set
+`API_BEARER_TOKEN` in the API server's `.env` to a unique secret. Generate one locally:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Keep the token in the frontend **server's** secret store and send it as:
+
+```http
+Authorization: Bearer <API_BEARER_TOKEN>
+```
+
+Do not put the shared token in browser JavaScript or a public frontend build: users can
+extract it. Browser clients should call their own backend, which adds the bearer header
+when it calls this API. For a cross-origin browser request, set `CORS_ORIGINS` to the
+exact frontend origin; CORS is not authentication. To allow remote connections, bind
+the API to an appropriate network interface (for example, in PowerShell set
+`$env:API_HOST = "0.0.0.0"` before running `start_api.bat`). Expose it only over HTTPS
+through a trusted reverse proxy/firewall; bearer tokens sent over plain HTTP can be
+intercepted. Leave the CSV import endpoint on its separate `X-Ingestion-Key`.
+
+| Status Code | Reason | Cause |
+|---|---|---|
+| `200 OK` | Success | Request succeeded and forecast/data returned. |
+| `400 Bad Request` | Invalid filename | `sync-csv` filename contains path separators or does not end with `.csv`. |
+| `401 Unauthorized` | Invalid credentials | Bearer token is missing/invalid, or the `X-Ingestion-Key` header is missing/invalid for CSV import. |
+| `404 Not Found` | File not found | CSV file specified in `sync-csv` was not found in `data/`. |
+| `422 Unprocessable Entity` | Parameter validation error | Missing/malformed dates, `start_date` after `end_date`, `end_date` not after the latest observation or more than 180 days after it, negative threshold, unsupported state/price type, or invalid CSV data. |
+| `500 Internal Server Error` | Execution error | Missing required column in SQLite, or Chronos-2 pipeline failure. |
+| `503 Service Unavailable` | Service or Model not ready | Model dependencies missing, `API_BEARER_TOKEN` is not configured for protected API routes, or a unique `INGESTION_API_KEY` has not been configured for CSV import. |

@@ -4,7 +4,7 @@ This dashboard is for model/response inspection. The production frontend team ca
 consume the same FastAPI endpoints; see FRONTEND_INTEGRATION.md.
 """
 from __future__ import annotations
-
+from datetime import date, timedelta
 import os
 from typing import Any
 
@@ -44,8 +44,8 @@ STATE_LABELS = {
     "MH": "Maharashtra",
     "MP": "Madhya Pradesh",
 }
-HORIZONS = [7, 14, 30, 60, 90]
-HORIZON_LABELS = {7: "1W", 14: "2W", 30: "1M", 60: "2M", 90: "3M"}
+HORIZONS = [7, 14, 30, 60, 90, 180]
+HORIZON_LABELS = {7: "1W", 14: "2W", 30: "1M", 60: "2M", 90: "3M", 180: "6M"}
 STATE_COLORS = {"AP": "#4469a8", "KA": "#bd6b88", "MH": "#9270b5", "MP": "#599a91"}
 PRICE_COLORS = {"retail": "#4469a8", "mandi_modal": "#b28a3b", "wholesale": "#b28a3b"}
 
@@ -70,7 +70,16 @@ with st.sidebar:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def api_get(url: str, params: tuple[tuple[str, Any], ...]) -> dict:
-    response = requests.get(url, params=dict(params), timeout=1800)
+    token = os.getenv("API_BEARER_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("API_BEARER_TOKEN is missing from the dashboard environment.")
+
+    response = requests.get(
+        url,
+        params=dict(params),
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=1800,
+    )
     try:
         body = response.json()
     except ValueError:
@@ -82,6 +91,25 @@ def api_get(url: str, params: tuple[tuple[str, Any], ...]) -> dict:
 
 def fetch_graph(endpoint: str, params: dict[str, Any]) -> dict:
     return api_get(f"{api_base}{endpoint}", tuple(sorted(params.items())))
+
+
+def forecast_hover_data(forecast: pd.DataFrame) -> tuple[Any, str]:
+    fields = [
+        "latest_actual_price_rs_kg",
+        "change_rs_kg",
+        "change_percent",
+        "change_direction",
+    ]
+    if not all(field in forecast.columns for field in fields):
+        return None, "Date: %{x}<br>P50: ₹%{y:.2f}/kg<extra></extra>"
+
+    return forecast[fields].to_numpy(), (
+        "Date: %{x}<br>P50: ₹%{y:.2f}/kg"
+        "<br>Latest actual: ₹%{customdata[0]:.2f}/kg"
+        "<br>Change: %{customdata[1]:+.2f} ₹/kg"
+        "<br>Change: %{customdata[2]:+.2f}% (%{customdata[3]})"
+        "<extra></extra>"
+    )
 
 
 def set_freshness(payload: dict) -> None:
@@ -100,15 +128,16 @@ def section_heading(title: str, subtitle: str) -> None:
     st.markdown(f'<div class="section-title">{title}</div><div class="section-subtitle">{subtitle}</div>', unsafe_allow_html=True)
 
 
-def horizon_control(key: str, label: str = "Forecast") -> int:
-    return st.radio(
+def date_range_control(key: str, label: str) -> tuple[date, date] | None:
+    selected = st.date_input(
         label,
-        options=HORIZONS,
-        index=0,
-        format_func=lambda n: f"{HORIZON_LABELS[n]} · {n}d",
-        horizontal=True,
+        value=(date.today() - timedelta(days=30), date.today() + timedelta(days=30)),
         key=key,
     )
+    if not isinstance(selected, tuple) or len(selected) != 2:
+        st.info("Select both a start date and an end date.")
+        return None
+    return selected
 
 
 def add_forecast_band(fig: go.Figure, x, lower, upper, color: str, name: str, legendgroup: str) -> None:
@@ -158,7 +187,7 @@ st.markdown('''<div class="hero">
 section_heading("AP retail price forecast", "Andhra Pradesh onion prices · Last 3 months of actuals and the selected forecast horizon")
 c1, c2 = st.columns([1.35, 1.2])
 with c1:
-    horizon1 = horizon_control("g1_horizon", "Forecast horizon")
+    range1 = date_range_control("g1_date_range", "Date range")
 with c2:
     opt1, opt2, opt3 = st.columns(3)
     with opt1:
@@ -169,6 +198,7 @@ with c2:
         show_mandi = st.checkbox("Mandi modal price", value=False, key="g1_mandi")
 run1 = st.button("Update AP forecast", type="primary", key="g1_run")
 if run1:
+    api_get.clear()
     st.session_state["g1_started"] = True
 if run1 or st.session_state.get("g1_started", False):
     selected_price_types = []
@@ -186,7 +216,11 @@ if run1 or st.session_state.get("g1_started", False):
             try:
                 st.session_state["g1_payload"] = fetch_graph(
                     "/api/graphs/ap-retail",
-                    {"horizon_days": horizon1, "price_types": ",".join(selected_price_types), "history_days": 90},
+                    {
+    "price_types": ",".join(selected_price_types),
+    "start_date": range1[0].isoformat(),
+    "end_date": range1[1].isoformat(),
+},
                 )
                 st.session_state["g1_error"] = None
             except Exception as exc:
@@ -213,30 +247,57 @@ if payload1:
                 ))
             if not pred.empty:
                 add_forecast_band(fig1, pred["date"], pred["p10_rs_kg"], pred["p90_rs_kg"], color, f"{label} · P10–P90", ptype)
+                hover_data, hover_template = forecast_hover_data(pred)
                 fig1.add_trace(go.Scatter(
                     x=pred["date"], y=pred["predicted_price_rs_kg"], mode="lines",
+                    customdata=hover_data,
                     name=f"{label} · forecast P50", line={"color": color, "width": 2.7, "dash": "dash"},
-                    legendgroup=ptype, hovertemplate="Date: %{x}<br>P50: ₹%{y:.2f}/kg<extra></extra>",
+                    legendgroup=ptype,
+                    hovertemplate=hover_template,
                 ))
+        threshold1 = payload1.get("threshold_rs_kg", 44.0)
+        fig1.add_hline(
+            y=threshold1,
+            line_dash="dash",
+            line_color="#d9534f",
+            annotation_text=f"Threshold ₹{threshold1:g}/kg",
+            annotation_position="top left",
+        )
         # Mark the boundary between latest actual and future forecast.
         fig1.add_vline(x=payload1.get("forecast_start_date"), line_dash="dot", line_color="#8d96a5", opacity=.7)
         configure_chart(fig1, height=420)
         st.plotly_chart(fig1, use_container_width=True)
 
-        # Compact summary values, based only on the selected series.
+        # Compare the first forecast with the latest actual returned by the API.
         metrics = []
         for ptype in payload1.get("price_types", []):
-            hist = hdf[hdf["price_type"] == ptype]
             pred = fdf[fdf["price_type"] == ptype]
-            if not hist.empty and not pred.empty:
+            if not pred.empty:
                 label = {"retail": "AP retail", "wholesale": "AP wholesale", "mandi_modal": "AP mandi modal"}.get(ptype, ptype)
-                metrics.append((label, hist.iloc[-1]["actual_price_rs_kg"], pred.iloc[0]["predicted_price_rs_kg"], pred.iloc[0]["p10_rs_kg"], pred.iloc[0]["p90_rs_kg"]))
+                metrics.append((label, pred.sort_values("date").iloc[0]))
         if metrics:
             cols = st.columns(len(metrics))
-            for col, metric in zip(cols, metrics):
-                label, actual, p50, p10, p90 = metric
-                col.metric(f"{label} · latest actual", f"₹{actual:.2f}/kg")
-                col.caption(f"First forecast P50 ₹{p50:.2f}/kg · P10 ₹{p10:.2f} · P90 ₹{p90:.2f}")
+            for col, (label, forecast_row) in zip(cols, metrics):
+                actual = forecast_row.get("latest_actual_price_rs_kg")
+                actual_date = forecast_row.get("latest_actual_date")
+                change_percent = forecast_row.get("change_percent")
+                direction = forecast_row.get("change_direction")
+                delta = (
+                    f"{change_percent:+.2f}% · {direction}"
+                    if pd.notna(change_percent) and direction
+                    else "Change fields missing from API"
+                )
+                col.metric(
+                    f"{label} · latest actual",
+                    f"₹{actual:.2f}/kg" if pd.notna(actual) else "Unavailable",
+                    delta=delta,
+                )
+                col.caption(
+                    f"Baseline {actual_date or 'unavailable'} · First forecast "
+                    f"₹{forecast_row['predicted_price_rs_kg']:.2f}/kg "
+                    f"({forecast_row['date']}) · P10 ₹{forecast_row['p10_rs_kg']:.2f} "
+                    f"· P90 ₹{forecast_row['p90_rs_kg']:.2f}"
+                )
         with st.expander("Forecast rows / API values"):
             st.dataframe(fdf, use_container_width=True, hide_index=True)
         st.download_button("Download AP price forecast CSV", fdf.to_csv(index=False), file_name=f"ap_price_forecast_{payload1['horizon_days']}d.csv", mime="text/csv", key="g1_download")
@@ -257,9 +318,10 @@ with g2a:
     )
 with g2b:
     selected_price_types2 = st.multiselect("Price types", ["retail", "wholesale", "mandi_modal"], default=["retail", "wholesale", "mandi_modal"], format_func=lambda x: {"retail": "Retail price", "wholesale": "Wholesale price", "mandi_modal": "Mandi modal price"}[x], key="g2_types")
-horizon2 = horizon_control("g2_horizon", "Comparison horizon")
+range2 = date_range_control("g2_date_range", "Date range")
 run2 = st.button("Update state comparison", type="primary", key="g2_run")
 if run2:
+    api_get.clear()
     st.session_state["g2_started"] = True
 if run2 or st.session_state.get("g2_started", False):
     if not selected_states or not selected_price_types2:
@@ -270,7 +332,12 @@ if run2 or st.session_state.get("g2_started", False):
             try:
                 st.session_state["g2_payload"] = fetch_graph(
                     "/api/graphs/state-comparison",
-                    {"states": ",".join(selected_states), "price_types": ",".join(selected_price_types2), "horizon_days": horizon2, "history_days": 90},
+                    {
+    "states": ",".join(selected_states),
+    "price_types": ",".join(selected_price_types2),
+    "start_date": range2[0].isoformat(),
+    "end_date": range2[1].isoformat(),
+},
                 )
                 st.session_state["g2_error"] = None
             except Exception as exc:
@@ -294,13 +361,68 @@ if payload2:
                 fig2.add_trace(go.Scatter(x=hist["date"], y=hist["actual_price_rs_kg"], mode="lines", name=f"{label} · actual", line={"color": color, "width": 2, "dash": dash}, legendgroup=f"{state}-{ptype}"))
             if not pred.empty:
                 add_forecast_band(fig2, pred["date"], pred["p10_rs_kg"], pred["p90_rs_kg"], color, f"{label} · P10–P90", f"{state}-{ptype}")
-                fig2.add_trace(go.Scatter(x=pred["date"], y=pred["predicted_price_rs_kg"], mode="lines", name=f"{label} · forecast P50", line={"color": color, "width": 2.4, "dash": "dash" if ptype == "retail" else "dashdot"}, legendgroup=f"{state}-{ptype}"))
+                hover_data, hover_template = forecast_hover_data(pred)
+                fig2.add_trace(go.Scatter(
+                    x=pred["date"],
+                    y=pred["predicted_price_rs_kg"],
+                    mode="lines",
+                    customdata=hover_data,
+                    name=f"{label} · forecast P50",
+                    line={"color": color, "width": 2.4, "dash": "dash" if ptype == "retail" else "dashdot"},
+                    legendgroup=f"{state}-{ptype}",
+                    hovertemplate=hover_template,
+                ))
     if payload2.get("forecast_start_date"):
         fig2.add_vline(x=payload2["forecast_start_date"], line_dash="dot", line_color="#8d96a5", opacity=.7)
+    threshold2 = payload2.get("threshold_rs_kg", 44.0)
+    fig2.add_hline(
+        y=threshold2,
+        line_dash="dash",
+        line_color="#d9534f",
+        annotation_text=f"Threshold ₹{threshold2:g}/kg",
+        annotation_position="top left",
+    )
     configure_chart(fig2, height=470)
     st.plotly_chart(fig2, use_container_width=True)
     st.caption("Only selected states and price types are included in the API response. Forecasts use all stored historical rows; the chart displays the last 90 actual days.")
     if not fdf2.empty:
+        comparison_fields = [
+            "latest_actual_date",
+            "latest_actual_price_rs_kg",
+            "change_rs_kg",
+            "change_percent",
+            "change_direction",
+        ]
+        missing_fields = [field for field in comparison_fields if field not in fdf2.columns]
+        if missing_fields:
+            st.warning(
+                "The API response is missing comparison fields: "
+                + ", ".join(missing_fields)
+            )
+        else:
+            first_forecasts = (
+                fdf2.sort_values("date")
+                .groupby(["state", "price_type"], as_index=False)
+                .first()
+            )
+            st.markdown("#### First forecast change vs latest actual")
+            st.dataframe(
+                first_forecasts[
+                    [
+                        "state",
+                        "price_type",
+                        "latest_actual_date",
+                        "latest_actual_price_rs_kg",
+                        "date",
+                        "predicted_price_rs_kg",
+                        "change_rs_kg",
+                        "change_percent",
+                        "change_direction",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
         with st.expander("Comparison forecast rows"):
             st.dataframe(fdf2, use_container_width=True, hide_index=True)
         st.download_button("Download comparison forecast CSV", fdf2.to_csv(index=False), file_name="selected_state_price_forecasts.csv", mime="text/csv", key="g2_download")
@@ -319,7 +441,7 @@ with g3a:
     qty_states = st.multiselect("States for quantity outlook", options=list(STATE_LABELS), default=["AP"], format_func=lambda code: STATE_LABELS[code], key="g3_states")
 with g3b:
     st.caption("Only Supply and Consumption are forecast targets. Arrivals and Production are combined into Supply before forecasting.")
-horizon3 = horizon_control("g3_horizon", "Forecast horizon")
+range3 = date_range_control("g3_date_range", "Date range")
 run3 = st.button("Update supply / demand outlook", type="primary", key="g3_run")
 if run3:
     st.session_state["g3_started"] = True
@@ -332,7 +454,11 @@ if run3 or st.session_state.get("g3_started", False):
             try:
                 st.session_state["g3_payload"] = fetch_graph(
                     "/api/graphs/supply-balance",
-                    {"states": ",".join(qty_states), "horizon_days": horizon3, "history_days": 90},
+                    {
+    "states": ",".join(qty_states),
+    "start_date": range3[0].isoformat(),
+    "end_date": range3[1].isoformat(),
+},
                 )
                 st.session_state["g3_error"] = None
             except Exception as exc:
@@ -351,7 +477,12 @@ if payload3:
             color = STATE_COLORS.get(state, "#4469a8")
             hist_state = qhist[qhist["state"] == state]
             pred_state = qpred[qpred["state"] == state]
-            for metric, label, dash in [("supply", "Supply", "solid"), ("consumption", "Consumption", "dot")]:
+            for metric, label, dash in [
+                ("supply", "Supply", "solid"),
+                ("consumption", "Consumption", "dot"),
+                ("arrival", "Arrivals", "dash"),
+                ("production", "Production", "dashdot"),
+            ]:
                 h = hist_state[hist_state["metric"] == metric]
                 f = pred_state[pred_state["metric"] == metric]
                 if not h.empty:
