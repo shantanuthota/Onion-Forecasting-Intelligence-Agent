@@ -121,6 +121,41 @@ The raw response will be saved under `data/upag_raw_agmarknet.json`. The payload
 
 Before turning polling on, the next implementation step is a source adapter that maps the real UPAg response into the canonical daily dataset (date × state, retail price, mandi price, arrivals, and validated quantity series). Retail and mandi/arrival data may come from different sources and different geographic granularities; do not merge them by date alone until the state, unit, crop and market dimensions are verified. Share only the **source names, redacted request payload, and a few redacted response rows** so the adapter can be tailored. Never share account credentials.
 
+## Automated 6-hourly UPAg Dash ingestion
+
+`pull_upag_dash.py` keeps the SQLite history current without any manual CSV work. Every run:
+
+1. Requests **yesterday's date** (Asia/Kolkata) from the public UPAg Dash MIP by-crop endpoint for all four states (AP, MH, KA, MP).
+2. Extracts the four sourced series per state — **retail, wholesale and mandi modal prices (Rs/Qtl, unconverted)** and **mandi arrivals (Tonnes ×10 → metric quintals)**.
+3. Appends dates that are missing, corrects single values that the source revised (logged in `data/corrections_log.csv`), and skips identical values — so the four runs per day are idempotent.
+4. Forward-fills the two series this source does not provide (**production, consumption**) on new dates from the previous row, matching how the "Interpolated" dataset was built. If the DB lags behind yesterday, the window auto-extends back to `DB_last + 1` and unfilled dates become `upag_dash_6h_gapfill` rows so the daily index never breaks.
+
+Mapping provenance: every series was cross-checked against the ingested history on 2026-10-28 with anchor dates for all four states (e.g. AP 2022-01-01 retail 4000.0, MP 2023-06-18 wholesale 1205.45, MP arrivals 1219.35 T → 12193.5 qtl). A mismatch raises loudly and blocks ingestion (`dash_extract.ANCHORS`).
+
+Run it manually:
+
+```powershell
+.\.venv\Scripts\python.exe pull_upag_dash.py --dry-run      # fetch + compare, zero DB writes
+.\.venv\Scripts\python.exe pull_upag_dash.py --once        # append/correct now
+.\.venv\Scripts\python.exe pull_upag_dash.py --days 3      # catch-up back 3 days (late mandi rows)
+.\.venv\Scripts\python.exe pull_upag_dash.py --full-history # 2022-01-01..yesterday reconciliation
+```
+
+Schedule it (runs at 00:00 / 06:00 / 12:00 / 18:00 local time, survives API/dashboard restarts):
+
+```powershell
+.\setup_scheduler_6h.bat     # creates task "OnionUPAgDash6h"
+.\remove_scheduler_6h.bat    # removes it again
+```
+
+Backend-coupled alternative: `.\backend.bat` starts the FastAPI server **and** enables
+the task only while the backend runs (disables it again on Ctrl+C). The standalone
+install above remains the default and is independent of the backend.
+
+Every run is auditable in `ingestion_log`, and raw responses are snapshotted under `data/snapshots/` (newest 30 kept). Environment switches live in `.env` (`UPAG_DASH_ENABLED`, `UPAG_DASH_DAYS`, `UPAG_DASH_SNAPSHOTS`, `UPAG_DASH_UPDATE_EXISTING`, …). Lock file `data/pull_upag_dash.lock` prevents overlapping runs. Offline tests: `pytest tests\test_dash_ingestion.py`.
+
+The scheduled job fetches UPAg Dash data and writes it directly to SQLite; it does not call the local FastAPI HTTP API. The API reads the updated database when its data endpoints are requested.
+
 ## Chronos-2 output interpretation
 
 - P50 is the median forecast.

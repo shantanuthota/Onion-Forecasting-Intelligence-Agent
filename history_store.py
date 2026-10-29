@@ -9,9 +9,10 @@ Forecast prices are persisted separately in INR/kg, as requested.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -263,6 +264,208 @@ def upsert_frame(frame: pd.DataFrame, source: str = "model_ready_csv") -> SyncRe
             conn.commit()
             raise
     return result
+
+
+TOLERANCE = 1e-6
+
+
+@dataclass
+class DashUpsertResult:
+    source: str
+    rows_seen: int
+    inserted: int
+    updated: int
+    unchanged: int
+    gap_filled: int = 0
+    correction_count: int = 0
+    latest_observation_date: str | None = None
+    corrections: list[dict[str, Any]] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"source": self.source, "rows_seen": self.rows_seen, "inserted": self.inserted,
+                "updated": self.updated, "unchanged": self.unchanged, "gap_filled": self.gap_filled,
+                "corrections": self.correction_count,
+                "latest_observation_date": self.latest_observation_date}
+
+
+def latest_observation_date() -> str | None:
+    with connect() as conn:
+        _create_schema(conn)
+        row = conn.execute("SELECT MAX(timestamp) AS latest, COUNT(*) AS n FROM observations").fetchone()
+    if row is None or int(row["n"]) == 0:
+        return None
+    return str(row["latest"])
+
+
+def existing_dates_between(from_iso: str, to_iso: str) -> set[str]:
+    with connect() as conn:
+        _create_schema(conn)
+        rows = conn.execute("SELECT timestamp FROM observations WHERE timestamp >= ? AND timestamp <= ?",
+                            (from_iso, to_iso)).fetchall()
+    return {str(r["timestamp"]) for r in rows}
+
+
+def _validate_dash_updates(series_updates: dict[str, dict[str, float]]) -> None:
+    if not isinstance(series_updates, dict):
+        raise ValueError("series_updates must be a dict of date -> {column: value}.")
+    for stamp, columns in series_updates.items():
+        try:
+            datetime.strptime(str(stamp), "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(f"Invalid observation date {stamp!r}; expected YYYY-MM-DD: {exc}") from exc
+        unknown = [c for c in columns if c not in NUMERIC_COLUMNS]
+        if unknown:
+            raise ValueError(f"Unknown observation columns for {stamp}: {unknown}.")
+        for column, value in columns.items():
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ValueError(f"Non-finite value for {column} on {stamp}: {value!r}.")
+
+
+def classify_dash_updates(series_updates: dict[str, dict[str, float]]) -> dict[str, Any]:
+    """Read-only classification of (date, column) values against the current DB.
+
+    Returns missing_dates (rows that would be inserted), corrections (existing
+    values that differ beyond TOLERANCE; never applied here) and unchanged count.
+    Used by pull_upag_dash.py for --dry-run reporting and pre-write attribution.
+    """
+    _validate_dash_updates(series_updates)
+    corrections: list[dict[str, Any]] = []
+    unchanged = 0
+    missing_dates: list[str] = []
+    with connect() as conn:
+        _create_schema(conn)
+        for stamp in sorted(series_updates):
+            row = conn.execute('SELECT * FROM "observations" WHERE "timestamp"=?', (stamp,)).fetchone()
+            if row is None:
+                missing_dates.append(stamp)
+                continue
+            for column in sorted(series_updates[stamp]):
+                new_value = float(series_updates[stamp][column])
+                old_value = float(row[column])
+                if abs(new_value - old_value) <= TOLERANCE:
+                    unchanged += 1
+                else:
+                    corrections.append({"date": stamp, "column": column,
+                                        "old_value": old_value, "new_value": new_value, "applied": False})
+    return {"missing_dates": missing_dates, "corrections": corrections, "unchanged": unchanged}
+
+
+def upsert_dash_observations(series_updates: dict[str, dict[str, float]],
+                             gap_dates: Iterable[str] | None = None,
+                             source: str = "upag_dash_6h",
+                             source_correction: str = "upag_dash_6h_correction",
+                             source_gapfill: str = "upag_dash_6h_gapfill",
+                             update_existing: bool = True) -> DashUpsertResult:
+    """Partial-aware append/correct upsert for scheduled Dash ingestion.
+
+    - For each date in series_updates with sourced values (ascending order):
+      * date absent -> INSERT a complete row: sourced values + every not-sourced
+        column forward-filled from the previous row (mirrors the "Interpolated"
+        dataset convention). All 24 columns are REAL NOT NULL.
+      * date present -> compare per column: <= TOLERANCE -> unchanged; differs ->
+        correction: update ONLY that column (source/source_correction) and record
+        before/after; skipped when update_existing is False (logged, not applied).
+    - For each date in gap_dates: if still absent, INSERT a full forward-filled
+      row (source/source_gapfill) so the daily index never gets a gap.
+
+    The caller is responsible for writing the ingestion_log audit row
+    (see record_sync); this function only performs observation-table writes.
+    """
+    _validate_dash_updates(series_updates)
+    rows_seen = sum(len(columns) for columns in series_updates.values())
+    corrections: list[dict[str, Any]] = []
+    inserted = updated = unchanged = gap_filled = 0
+    ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    insert_columns = ["timestamp", "item_id", *NUMERIC_COLUMNS, "source", "ingested_at"]
+    insert_sql = (
+        f'INSERT INTO "observations" ({", ".join(chr(34) + c + chr(34) for c in insert_columns)}) '
+        f'VALUES ({", ".join("?" for _ in insert_columns)})'
+    )
+
+    with connect() as conn:
+        _create_schema(conn)
+        try:
+            current = conn.execute('SELECT * FROM "observations" ORDER BY "timestamp" DESC LIMIT 1').fetchone()
+            if current is None:
+                raise ValueError(
+                    "SQLite history is empty; import the model-ready CSV first with sync_model_ready_csv.py."
+                )
+            last_stamp = str(current["timestamp"])
+            last_item_id = str(current["item_id"])
+            last_values = {c: float(current[c]) for c in NUMERIC_COLUMNS}
+
+            def refresh_last() -> None:
+                nonlocal last_stamp, last_values, last_item_id
+                row = conn.execute('SELECT * FROM "observations" ORDER BY "timestamp" DESC LIMIT 1').fetchone()
+                if row is not None:
+                    last_stamp = str(row["timestamp"])
+                    last_values = {c: float(row[c]) for c in NUMERIC_COLUMNS}
+                    last_item_id = str(row["item_id"])
+
+            for stamp in sorted(set(series_updates) | set(gap_dates or [])):
+                sourced = series_updates.get(stamp)
+                existing = conn.execute('SELECT * FROM "observations" WHERE "timestamp"=?', (stamp,)).fetchone()
+                if existing is None:
+                    row_values = {c: last_values[c] for c in NUMERIC_COLUMNS}
+                    if sourced:
+                        row_values.update({c: float(v) for c, v in sourced.items()})
+                        inserted += len(sourced)
+                        label = source
+                    else:
+                        gap_filled += 1
+                        label = source_gapfill
+                    conn.execute(insert_sql, [stamp, last_item_id, *[row_values[c] for c in NUMERIC_COLUMNS],
+                                              label, ingested_at])
+                    if stamp > last_stamp:
+                        refresh_last()
+                elif sourced:
+                    changes: dict[str, float] = {}
+                    edits = sorted(sourced)
+                    for column in edits:
+                        new_value = float(sourced[column])
+                        old_value = float(existing[column])
+                        if abs(new_value - old_value) <= TOLERANCE:
+                            unchanged += 1
+                        elif update_existing:
+                            changes[column] = new_value
+                            updated += 1
+                            corrections.append({"date": stamp, "column": column, "old_value": old_value,
+                                                "new_value": new_value, "applied": True})
+                        else:
+                            corrections.append({"date": stamp, "column": column, "old_value": old_value,
+                                                "new_value": new_value, "applied": False})
+                            unchanged += 1
+                    if changes:
+                        set_sql = ", ".join(f'"{c}"=?' for c in changes)
+                        conn.execute(
+                            f'UPDATE "observations" SET {set_sql}, "source"=?, "ingested_at"=? WHERE "timestamp"=?',
+                            [*changes.values(), source_correction, ingested_at, stamp],
+                        )
+                        if stamp >= last_stamp:
+                            refresh_last()
+            latest = conn.execute('SELECT MAX("timestamp") AS m FROM "observations"').fetchone()["m"]
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            failed = SyncResult(source, rows_seen, inserted, updated, unchanged, None)
+            _log_sync(conn, failed, status="error", message=str(exc))
+            conn.commit()
+            raise
+    return DashUpsertResult(source=source, rows_seen=rows_seen, inserted=inserted, updated=updated,
+                            unchanged=unchanged, gap_filled=gap_filled, correction_count=len(corrections),
+                            latest_observation_date=str(latest) if latest else None,
+                            corrections=corrections)
+
+
+def record_sync(source: str, status: str, rows_seen: int = 0, inserted: int = 0, updated: int = 0,
+                unchanged: int = 0, latest_observation: str | None = None, message: str | None = None) -> None:
+    """Public audit-row helper for callers outside this module."""
+    with connect() as conn:
+        _create_schema(conn)
+        _log_sync(conn, SyncResult(source, rows_seen, inserted, updated, unchanged, latest_observation),
+                  status=status, message=message)
+        conn.commit()
 
 
 def _mark_source_synced(path: Path) -> None:
