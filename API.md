@@ -33,12 +33,30 @@ These endpoints execute Chronos-2 predictions on historical market data and auto
 All three graph endpoints require `start_date` and `end_date` in `YYYY-MM-DD` format.
 Actual observations and forecast records are returned only inside this inclusive date
 range. The model forecasts from the day after the latest stored observation through
-`end_date`, using the full stored history as context. The end date must be after the
-latest observation and no more than 180 days after it. `horizon_days` is calculated as
-the number of days from the latest observation through `end_date`; it appears in the
-response and is not a request parameter. A graph request runs the forecast and saves
-it to SQLite. Identical predictions may be reused from the API's in-memory cache.
-`start_date` must be on or before `end_date`.
+`end_date`, using the full stored history as context. When `end_date` is more than 180
+days after the latest observation, the API returns a successful response with empty
+historical and forecast arrays; it does not run or save a forecast. Otherwise,
+`horizon_days` is calculated as the number of days from the latest observation through
+`end_date`; it appears in the response and is not a request parameter. A graph request
+within the supported horizon runs the forecast and saves it to SQLite. Identical
+predictions may be reused from the API's in-memory cache. `start_date` must be on or
+before `end_date`.
+
+The 180-day cap is measured from the latest observation in the API server's database,
+not from `start_date` or from the length of the selected display range. If a short
+selection exceeds the cap, check `last_observation_date` and `horizon_days` in the
+response, then compare the remote server's `GET /api/ingestion/status` with the local
+server. Sync or redeploy current history to the remote API before retrying.
+
+For Graph 1 and Graph 2, actual observations are returned from `start_date` through
+`actual_end_date` (the earlier of `end_date` and the server's current date). Forecast
+rows are returned from today through `end_date`, but never overlap an actual observation:
+if today's observation is already present, forecasts start the next day. Their responses
+include `requested_end_date`, `actual_end_date`, and `forecast_start_date`; the
+`visible_end_date` remains the requested `end_date`. If `end_date` is before today, these
+endpoints return historical observations only and do not run or save a forecast. The
+model horizon remains bounded by 180 days after the latest observation. Graph 3 keeps
+the requested `end_date` behavior described above.
 
 ### 1.1 Graph 1: Andhra Pradesh (AP) Price Forecast
 *Endpoint for predicting retail, wholesale, and mandi modal onion prices for Andhra Pradesh.*
@@ -52,7 +70,7 @@ it to SQLite. Identical predictions may be reused from the API's in-memory cache
 |---|---|---|---|---|---|
 | `price_types` | string | No | `retail` | Comma-separated: `retail`, `wholesale`, `mandi_modal` | Price series to include. Case-insensitive. |
 | `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
-| `end_date` | date | Yes | — | `YYYY-MM-DD`, after and at most 180 days after latest observation | Last date to display; the model forecasts through this date. |
+| `end_date` | date | Yes | — | `YYYY-MM-DD`; more than 180 days after latest observation returns an empty graph | Last date to display and forecast through. Actual observations stop at today; forecast rows start at today or the next day if an actual observation exists today. |
 | `threshold_rs_kg` | number | No | `44.0` | Greater than or equal to `0` | Chart reference threshold in INR/kg; echoed in the response. |
 
 #### Target & Covariate Logic:
@@ -79,6 +97,8 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
   "model_history_rows": 1760,
   "visible_start_date": "2026-10-01",
   "visible_end_date": "2026-11-30",
+  "requested_end_date": "2026-11-30",
+  "actual_end_date": "2026-10-29",
   "context_logic": {
     "retail": ["timestamp", "AP_retail_rs_per_metric_quintal", "AP_wholesale_rs_per_metric_quintal", "AP_mandi_modal_rs_per_metric_quintal"],
     "wholesale": ["timestamp", "AP_wholesale_rs_per_metric_quintal"],
@@ -95,7 +115,7 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
   ],
   "forecast": [
     {
-      "date": "2026-10-16",
+      "date": "2026-10-29",
       "state": "AP",
       "state_name": "Andhra Pradesh",
       "price_type": "retail",
@@ -137,10 +157,10 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
   },
   "last_observation_date": "2026-10-15",
   "data_staleness_days": 12,
-  "forecast_start_date": "2026-10-16",
+  "forecast_start_date": "2026-10-29",
   "forecast_end_date": "2026-11-30",
   "warnings": [
-    "Latest observation is 2026-10-15 (12 day(s) behind the server date)."
+    "Latest observation is 2026-10-15 (14 day(s) behind the server date)."
   ]
 }
 ```
@@ -160,7 +180,7 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
 | `states` | string | No | `AP,KA,MH,MP` | Comma-separated: `AP`, `KA`, `MH`, `MP` | States to forecast and compare. |
 | `price_types` | string | No | `retail,wholesale,mandi_modal` | Comma-separated: `retail`, `wholesale`, `mandi_modal` | Price types to include. |
 | `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
-| `end_date` | date | Yes | — | `YYYY-MM-DD`, after and at most 180 days after latest observation | Last date to display; the model forecasts through this date. |
+| `end_date` | date | Yes | — | `YYYY-MM-DD`; more than 180 days after latest observation returns an empty graph | Last date to display and forecast through. Actual observations stop at today; forecast rows start at today or the next day if an actual observation exists today. |
 | `threshold_rs_kg` | number | No | `44.0` | Greater than or equal to `0` | Chart reference threshold in INR/kg; echoed in the response. |
 
 #### Example Request:
@@ -179,6 +199,10 @@ GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start
   "horizon_days": 46,
   "unit": "INR/kg",
   "threshold_rs_kg": 44.0,
+  "visible_start_date": "2026-10-01",
+  "visible_end_date": "2026-11-30",
+  "requested_end_date": "2026-11-30",
+  "actual_end_date": "2026-10-29",
   "historical": [
     {
       "date": "2026-10-01",
@@ -190,7 +214,7 @@ GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start
   ],
   "forecast": [
     {
-      "date": "2026-10-16",
+      "date": "2026-10-29",
       "state": "MH",
       "state_name": "Maharashtra",
       "price_type": "wholesale",
@@ -232,10 +256,10 @@ GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start
   },
   "last_observation_date": "2026-10-15",
   "data_staleness_days": 12,
-  "forecast_start_date": "2026-10-16",
+  "forecast_start_date": "2026-10-29",
   "forecast_end_date": "2026-11-30",
   "warnings": [
-    "Latest observation is 2026-10-15 (12 day(s) behind the server date)."
+    "Latest observation is 2026-10-15 (14 day(s) behind the server date)."
   ]
 }
 ```
@@ -254,7 +278,7 @@ GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start
 |---|---|---|---|---|---|
 | `states` | string | No | `AP` | Comma-separated: `AP`, `KA`, `MH`, `MP` | States to calculate balance for. |
 | `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
-| `end_date` | date | Yes | — | `YYYY-MM-DD`, after and at most 180 days after latest observation | Last date to display; the model forecasts through this date. |
+| `end_date` | date | Yes | — | `YYYY-MM-DD`; if more than 180 days after latest observation, returns an empty graph | Last date to display; the model forecasts through this date when within the supported horizon. |
 
 #### Formula & Logic:
 - **Supply**: The historical supply series is calculated as `arrival + production` and forecast as its own univariate target. Its forecast is independent of the separately forecast arrival and production series; the API does not calculate forecast supply by summing their forecast values.
@@ -672,6 +696,6 @@ intercepted. Leave the CSV import endpoint on its separate `X-Ingestion-Key`.
 | `400 Bad Request` | Invalid filename | `sync-csv` filename contains path separators or does not end with `.csv`. |
 | `401 Unauthorized` | Invalid credentials | Bearer token is missing/invalid, or the `X-Ingestion-Key` header is missing/invalid for CSV import. |
 | `404 Not Found` | File not found | CSV file specified in `sync-csv` was not found in `data/`. |
-| `422 Unprocessable Entity` | Parameter validation error | Missing/malformed dates, `start_date` after `end_date`, `end_date` not after the latest observation or more than 180 days after it, negative threshold, unsupported state/price type, or invalid CSV data. |
+| `422 Unprocessable Entity` | Parameter validation error | Missing/malformed dates, `start_date` after `end_date`, an end date that produces an invalid forecast horizon, negative threshold, unsupported state/price type, or invalid CSV data. |
 | `500 Internal Server Error` | Execution error | Missing required column in SQLite, or Chronos-2 pipeline failure. |
 | `503 Service Unavailable` | Service or Model not ready | Model dependencies missing, `API_BEARER_TOKEN` is not configured for protected API routes, or a unique `INGESTION_API_KEY` has not been configured for CSV import. |

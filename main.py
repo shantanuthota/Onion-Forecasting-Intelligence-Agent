@@ -34,6 +34,7 @@ load_dotenv(ROOT / ".env")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("onion-forecast-api")
 MODEL_ID = os.getenv("CHRONOS_MODEL_ID", "amazon/chronos-2")
+MAX_FORECAST_HORIZON_DAYS = 180
 QUANTILES = [0.1, 0.5, 0.9]
 ALLOWED_HORIZONS = (7, 14, 30, 60, 90, 180)
 PRICE_TYPES = {"RETAIL": "retail",
@@ -136,9 +137,10 @@ def get_pipeline():
 
 
 def _validate_horizon(horizon_days: int) -> int:
-    if not 1 <= horizon_days <= 180:
+    if not 1 <= horizon_days <= MAX_FORECAST_HORIZON_DAYS:
         raise HTTPException(
-            status_code=422, detail="Forecast horizon must be between 1 and 180 days.")
+            status_code=422,
+            detail=f"Forecast horizon must be between 1 and {MAX_FORECAST_HORIZON_DAYS} days.")
     return horizon_days
 
 
@@ -148,11 +150,25 @@ def _date_range_horizon(data: pd.DataFrame, start_date: date, end_date: date) ->
             status_code=422, detail="start_date must be on or before end_date.")
 
     last_observation = pd.Timestamp(data["timestamp"].max()).date()
-    if (end_date - last_observation).days > 180:
+    horizon_days = max(0, (end_date - last_observation).days)
+    if horizon_days > MAX_FORECAST_HORIZON_DAYS:
         raise HTTPException(
-            status_code=422, detail="end_date cannot be more than 180 days after the latest observation.")
+            status_code=422,
+            detail="forecasting cannot exceed 180 days",
+        )
+    return horizon_days
 
-    return max(0, (end_date - last_observation).days)
+
+def _actual_end_date(requested_end_date: date) -> date:
+    return min(requested_end_date, date.today())
+
+
+def _forecast_display_start_date(
+    data: pd.DataFrame, start_date: date, end_date: date
+) -> date | None:
+    last_observation = pd.Timestamp(data["timestamp"].max()).date()
+    forecast_start = max(start_date, date.today(), last_observation + pd.Timedelta(days=1))
+    return forecast_start if forecast_start <= end_date else None
 
 
 def _parse_list(raw: str, allowed: set[str], label: str) -> list[str]:
@@ -449,7 +465,7 @@ def ap_retail_graph(
         start_date: date = Query(...,
                                  description="First date to display, YYYY-MM-DD"),
         end_date: date = Query(
-            ..., description="Last date to display and forecast through, YYYY-MM-DD"),
+            ..., description="Last date to display and forecast through, YYYY-MM-DD; actuals display through today, and the forecast displays from today (or the next day if today's actual exists) through end_date"),
         threshold_rs_kg: float = Query(
             44.0,
             ge=0,
@@ -458,6 +474,8 @@ def ap_retail_graph(
     data = get_data()
     requested = _parse_list(price_types, set(PRICE_TYPES), "price types")
     selected = [PRICE_TYPES[x] for x in requested]
+    actual_end_date = _actual_end_date(end_date)
+    forecast_display_start = _forecast_display_start_date(data, start_date, end_date)
     horizon_days = _date_range_horizon(data, start_date, end_date)
     forecast: list[dict] = []
     context_cols: list[str] = []
@@ -468,29 +486,38 @@ def ap_retail_graph(
                 [target, PRICE_COLUMNS["AP"]["wholesale"], PRICE_COLUMNS["AP"]["mandi_modal"]])
         else:
             context_cols.append(target)
-        result = _price_target_forecast(data, "AP", price_type, horizon_days)
-        forecast.extend(_filter_date_records(
-            _price_forecast_records(data, "AP", price_type, result),
-            start_date,
-            end_date,
-        ))
+        if horizon_days and forecast_display_start:
+            result = _price_target_forecast(data, "AP", price_type, horizon_days)
+            forecast.extend(_filter_date_records(
+                _price_forecast_records(data, "AP", price_type, result),
+                forecast_display_start,
+                end_date,
+            ))
     historical = []
     for price_type in selected:
         historical.extend(_history_price_records(
-            data, "AP", price_type, start_date, end_date))
-    saved = _persist_prices("graph1_ap_prices", data, horizon_days, forecast, list(
-        dict.fromkeys(context_cols)))
+            data, "AP", price_type, start_date, actual_end_date))
+    saved = (
+        _persist_prices("graph1_ap_prices", data, horizon_days, forecast, list(
+            dict.fromkeys(context_cols)))
+        if horizon_days and forecast_display_start
+        else None
+    )
     status = _status(data)
     return {"graph": "ap_price_forecast", "title": "Andhra Pradesh Onion Price Forecast", "state": "AP",
             "state_name": STATE_NAMES["AP"], "price_types": selected, "unit": "INR/kg",
             "threshold_rs_kg": threshold_rs_kg, "horizon_days": horizon_days,
             "model_history_rows": int(len(data)), "visible_start_date": start_date.isoformat(),
             "visible_end_date": end_date.isoformat(),
+            "requested_end_date": end_date.isoformat(),
+            "actual_end_date": actual_end_date.isoformat(),
             "context_logic": {"retail": ["timestamp", PRICE_COLUMNS["AP"]["retail"], PRICE_COLUMNS["AP"]["wholesale"], PRICE_COLUMNS["AP"]["mandi_modal"]],
                               "wholesale": ["timestamp", PRICE_COLUMNS["AP"]["wholesale"]],
                               "mandi_modal": ["timestamp", PRICE_COLUMNS["AP"]["mandi_modal"]]},
             "historical": historical, "forecast": forecast, "metadata": _metadata(), "saved_to_sqlite": saved,
-            **status, "forecast_end_date": max((r["date"] for r in forecast), default=None)}
+            **status,
+            "forecast_start_date": forecast_display_start.isoformat() if forecast_display_start else None,
+            "forecast_end_date": max((r["date"] for r in forecast), default=None)}
 
 
 @app.get("/api/graphs/state-comparison")
@@ -500,7 +527,7 @@ def state_comparison_graph(
     start_date: date = Query(...,
                              description="First date to display, YYYY-MM-DD"),
     end_date: date = Query(...,
-                           description="Last date to display and forecast through, YYYY-MM-DD"),
+                           description="Last date to display and forecast through, YYYY-MM-DD; actuals display through today, and the forecast displays from today (or the next day if today's actual exists) through end_date"),
     threshold_rs_kg: float = Query(
         44.0,
         ge=0,
@@ -511,12 +538,13 @@ def state_comparison_graph(
     selected_states = _parse_list(states, set(STATE_CODES), "states")
     requested = _parse_list(price_types, set(PRICE_TYPES), "price types")
     selected_types = [PRICE_TYPES[x] for x in requested]
+    actual_end_date = _actual_end_date(end_date)
+    forecast_display_start = _forecast_display_start_date(data, start_date, end_date)
     horizon_days = _date_range_horizon(data, start_date, end_date)
 
     forecast: list[dict] = []
     historical: list[dict] = []
     context_cols: list[str] = []
-
     for state in selected_states:
         for price_type in selected_types:
             target = PRICE_COLUMNS[state][price_type]
@@ -529,23 +557,31 @@ def state_comparison_graph(
             else:
                 context_cols.append(target)
 
-            result = _price_target_forecast(
-                data, state, price_type, horizon_days)
-            forecast.extend(
-                _price_forecast_records(data, state, price_type, result)
-            )
+            if horizon_days and forecast_display_start:
+                result = _price_target_forecast(
+                    data, state, price_type, horizon_days)
+                forecast.extend(_filter_date_records(
+                    _price_forecast_records(data, state, price_type, result),
+                    forecast_display_start,
+                    end_date,
+                ))
             historical.extend(
                 _history_price_records(
-                    data, state, price_type, start_date, end_date)
+                    data, state, price_type, start_date, actual_end_date)
             )
 
-    saved = _persist_prices(
-        "graph2_state_comparison",
-        data,
-        horizon_days,
-        forecast,
-        list(dict.fromkeys(context_cols)),
+    saved = (
+        _persist_prices(
+            "graph2_state_comparison",
+            data,
+            horizon_days,
+            forecast,
+            list(dict.fromkeys(context_cols)),
+        )
+        if horizon_days and forecast_display_start
+        else None
     )
+    status = _status(data)
     return {
         "graph": "state_price_comparison",
         "title": "Selected States — Onion Price Forecasts",
@@ -555,11 +591,16 @@ def state_comparison_graph(
         "horizon_days": horizon_days,
         "unit": "INR/kg",
         "threshold_rs_kg": threshold_rs_kg,
+        "visible_start_date": start_date.isoformat(),
+        "visible_end_date": end_date.isoformat(),
+        "requested_end_date": end_date.isoformat(),
+        "actual_end_date": actual_end_date.isoformat(),
         "historical": historical,
         "forecast": forecast,
         "metadata": _metadata(),
         "saved_to_sqlite": saved,
-        **_status(data),
+        **status,
+        "forecast_start_date": forecast_display_start.isoformat() if forecast_display_start else None,
         "forecast_end_date": max((r["date"] for r in forecast), default=None),
     }
 
@@ -570,7 +611,7 @@ def supply_balance_graph(
     start_date: date = Query(...,
                              description="First date to display, YYYY-MM-DD"),
     end_date: date = Query(...,
-                           description="Last date to display and forecast through, YYYY-MM-DD"),
+                           description="Last date to display and forecast through, YYYY-MM-DD; more than 180 days after the latest observation returns an empty graph"),
 ) -> dict:
     """Graph 3: forecast supply=arrival+production and consumption as independent univariate targets."""
     data = get_data()

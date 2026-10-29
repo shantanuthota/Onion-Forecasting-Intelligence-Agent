@@ -10,7 +10,12 @@ only when the browser must call this API directly; CORS does not protect the tok
 For remote access, use HTTPS and a firewall/reverse proxy. See [API.md](API.md) for
 token generation and server setup.
 
-All graph endpoints require inclusive `start_date` and `end_date` values in `YYYY-MM-DD` format. Forecasts run from the day after the latest stored observation through `end_date`; the end date must be no more than 180 days after the latest observation. The response includes the calculated `horizon_days`; it is not a request parameter. Returned historical and forecast records are filtered to the requested date range. Forecast price outputs are in INR/kg. The SQLite observations table retains historical prices in INR/metric quintal; actual-history values in the graph API are converted at response time to INR/kg so chart lines are comparable. Forecast price quantiles are converted to INR/kg and saved to SQLite.
+All graph endpoints require inclusive `start_date` and `end_date` values in `YYYY-MM-DD` format. The model forecasts from the day after the latest stored observation through `end_date`; `end_date` must be no more than 180 days after the latest observation. The response includes calculated `horizon_days`; it is not a request parameter. For Graph 1 and Graph 2, actual rows are returned through `actual_end_date` (the earlier of `end_date` and today), and forecast rows are returned from today through `end_date`. If today's actual observation exists, forecasts start the next day to avoid overlapping actual and predicted values. If `end_date` is before today, these graphs return actual rows only. Graph 3 retains the full requested-range behavior. Forecast price outputs are in INR/kg. The SQLite observations table retains historical prices in INR/metric quintal; actual-history values in the graph API are converted at response time to INR/kg so chart lines are comparable. Forecast price quantiles are converted to INR/kg and saved to SQLite.
+
+The 180-day limit is based on the remote API database's `last_observation_date`, not
+the selected display-range length. If the warning says the forecast horizon exceeds
+the cap for a short selection, check `GET /api/ingestion/status` on the remote API;
+its history may be stale compared with the local API.
 
 ## Graph 1 — AP prices
 
@@ -21,7 +26,7 @@ All graph endpoints require inclusive `start_date` and `end_date` values in `YYY
 - Response field `threshold_rs_kg`: the effective threshold value used for the chart.
 - `historical`: `date`, `state`, `price_type`, `actual_price_rs_kg`.
 - `forecast`: `date`, `state`, `price_type`, `latest_actual_date`, `latest_actual_price_rs_kg`, `predicted_price_rs_kg`, `change_rs_kg`, `change_percent`, `change_direction`, `p10_rs_kg`, `p50_rs_kg`, `p90_rs_kg`, `prediction_interval_width_rs_kg`, `interval_width_pct_of_median`.
-- Top-level date/status fields include `visible_start_date`, `visible_end_date`, `last_observation_date`, `data_staleness_days`, `forecast_start_date`, `forecast_end_date`, and `warnings`.
+- Top-level date/status fields include `visible_start_date`, `visible_end_date`, `actual_end_date`, `requested_end_date`, `last_observation_date`, `data_staleness_days`, `forecast_start_date`, `forecast_end_date`, and `warnings`.
 - `saved_to_sqlite`: run ID and number of saved quantile rows.
 
 Target logic:
@@ -36,6 +41,8 @@ Target logic:
 - `states`: any comma-separated subset of `AP`, `KA`, `MH`, `MP`.
 - `price_types`: any subset of `retail`, `wholesale`, `mandi_modal`.
 - `threshold_rs_kg`: optional horizontal chart threshold in INR/kg; defaults to `44` and is returned in the response.
+- `visible_start_date`, `visible_end_date`, `actual_end_date`, and `requested_end_date` describe the selected date range and actual-data cutoff.
+- Actual rows stop at today; forecast rows begin today or the next day if today's actual exists, and continue through `end_date`.
 - Price `forecast` rows include the latest observed price/date, median prediction, absolute/percentage change and direction, P10/P50/P90, and prediction-interval width fields (same shape as Graph 1).
 - Only selected states and series are returned and saved.
 - Retail uses each state's own retail/wholesale/mandi history; wholesale and mandi modal each use only their own history.
