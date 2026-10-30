@@ -16,7 +16,8 @@ This document covers all API endpoints, parameters, request headers, service log
   - Observation prices in SQLite: ₹ / metric quintal
   - Forecast prices in API & persistence: ₹ / kg (converted automatically: divide by 100)
   - Historical prices returned in graphs: ₹ / kg (converted for direct comparison with forecasts)
-  - Quantities (Arrival, Production, Consumption, Supply): Metric quintals / day
+  - Graph 1/2 daily arrivals: Metric quintals / day in model context
+  - Graph 3 AP production, consumption, arrivals, and shortfall: Tonnes / month
 
 Protected data and forecast routes require `Authorization: Bearer <API_BEARER_TOKEN>`.
 Configure `API_BEARER_TOKEN` in the API server's `.env`; keep the value in a trusted
@@ -32,15 +33,16 @@ These endpoints execute Chronos-2 predictions on historical market data and auto
 
 All three graph endpoints require `start_date` and `end_date` in `YYYY-MM-DD` format.
 Actual observations and forecast records are returned only inside this inclusive date
-range. The model forecasts from the day after the latest stored observation through
-`end_date`, using the full stored history as context. When `end_date` is more than 180
-days after the latest observation, the API returns a successful response with empty
-historical and forecast arrays; it does not run or save a forecast. Otherwise,
-`horizon_days` is calculated as the number of days from the latest observation through
-`end_date`; it appears in the response and is not a request parameter. A graph request
-within the supported horizon runs the forecast and saves it to SQLite. Identical
-predictions may be reused from the API's in-memory cache. `start_date` must be on or
-before `end_date`.
+range. Graphs 1 and 2 use daily data and forecast from the day after the latest
+observation. Graph 3 uses monthly AP data and forecasts month-start periods through the
+month containing `end_date`. The existing 180-day request limit is retained for all
+graphs. `horizon_days` remains the calendar-day distance from the latest source date to
+the requested end date, capped at 180. If `end_date` exceeds the supported horizon, the
+API forecasts through the latest supported date and returns a successful, partial-range
+response rather than rejecting the request. Graph 3 forecasts month-start periods through
+the last monthly observation not beyond that date. Successful forecasts are saved to
+SQLite and identical predictions may be reused from the API's in-memory cache.
+`start_date` must be on or before `end_date`.
 
 The 180-day cap is measured from the latest observation in the API server's database,
 not from `start_date` or from the length of the selected display range. If a short
@@ -50,33 +52,33 @@ server. Sync or redeploy current history to the remote API before retrying.
 
 For Graph 1 and Graph 2, actual observations are returned from `start_date` through
 `actual_end_date` (the earlier of `end_date` and the server's current date). Forecast
-rows are returned from today through `end_date`, but never overlap an actual observation:
+rows are returned from today through the effective forecast limit date, but never overlap an actual observation:
 if today's observation is already present, forecasts start the next day. Their responses
-include `requested_end_date`, `actual_end_date`, and `forecast_start_date`; the
-`visible_end_date` remains the requested `end_date`. If `end_date` is before today, these
-endpoints return historical observations only and do not run or save a forecast. The
-model horizon remains bounded by 180 days after the latest observation. Graph 3 keeps
-the requested `end_date` behavior described above.
+include `requested_end_date`, `forecast_limit_date`, `forecast_truncated`,
+`actual_end_date`, and `forecast_start_date`. `forecast_end_date` is the last point
+actually returned. The `visible_end_date` remains the requested `end_date`. If `end_date`
+is before today, these endpoints return historical observations only and do not run or
+save a forecast. Graph 3 returns month-start points up to the same 180-day limit.
 
 ### 1.1 Graph 1: Andhra Pradesh (AP) Price Forecast
 *Endpoint for predicting retail, wholesale, and mandi modal onion prices for Andhra Pradesh.*
 
 - **Method**: `GET`
 - **Path**: `/api/graphs/ap-retail`
-- **Description**: Returns historical observations and future forecasts for Andhra Pradesh. Retail price forecasts use multivariate covariates (wholesale and mandi modal prices as covariates forecast beforehand). Wholesale and mandi modal prices are forecast as univariate series.
+- **Description**: Returns historical observations and future forecasts for Andhra Pradesh using the configured daily price dataset. The three price targets use only their specified AP price and arrival history.
 
 #### Query Parameters:
 | Parameter | Type | Required | Default | Allowed Values / Constraints | Description |
 |---|---|---|---|---|---|
 | `price_types` | string | No | `retail` | Comma-separated: `retail`, `wholesale`, `mandi_modal` | Price series to include. Case-insensitive. |
 | `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
-| `end_date` | date | Yes | — | `YYYY-MM-DD`; more than 180 days after latest observation returns an empty graph | Last date to display and forecast through. Actual observations stop at today; forecast rows start at today or the next day if an actual observation exists today. |
+| `end_date` | date | Yes | — | `YYYY-MM-DD`; requests beyond 180 days return the maximum supported forecast range | Requested last date. If beyond the limit, response includes forecasts only through `forecast_limit_date` and sets `forecast_truncated` to `true`. |
 | `threshold_rs_kg` | number | No | `44.0` | Greater than or equal to `0` | Chart reference threshold in INR/kg; echoed in the response. |
 
 #### Target & Covariate Logic:
-- **`retail`**: Context uses Date + AP Retail + AP Wholesale + AP Mandi Modal. Future wholesale and mandi modal values are independently forecast first, then supplied as known future covariates.
-- **`wholesale`**: Context uses Date + AP Wholesale only.
-- **`mandi_modal`**: Context uses Date + AP Mandi Modal only.
+- **`retail`**: Context uses Date + AP Retail + AP Wholesale + AP Mandi Modal + AP Arrivals. Future covariates are independently forecast first.
+- **`wholesale`**: Context uses Date + AP Wholesale + AP Mandi Modal + AP Arrivals. Future covariates are independently forecast first.
+- **`mandi_modal`**: Context uses Date + AP Mandi Modal + AP Arrivals. Future arrivals are forecast first.
 
 #### Example Request:
 ```http
@@ -100,9 +102,9 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
   "requested_end_date": "2026-11-30",
   "actual_end_date": "2026-10-29",
   "context_logic": {
-    "retail": ["timestamp", "AP_retail_rs_per_metric_quintal", "AP_wholesale_rs_per_metric_quintal", "AP_mandi_modal_rs_per_metric_quintal"],
-    "wholesale": ["timestamp", "AP_wholesale_rs_per_metric_quintal"],
-    "mandi_modal": ["timestamp", "AP_mandi_modal_rs_per_metric_quintal"]
+    "retail": ["timestamp", "AP_retail_rs_per_metric_quintal", "AP_wholesale_rs_per_metric_quintal", "AP_mandi_modal_rs_per_metric_quintal", "AP_arrival_metric_quintal"],
+    "wholesale": ["timestamp", "AP_wholesale_rs_per_metric_quintal", "AP_mandi_modal_rs_per_metric_quintal", "AP_arrival_metric_quintal"],
+    "mandi_modal": ["timestamp", "AP_mandi_modal_rs_per_metric_quintal", "AP_arrival_metric_quintal"]
   },
   "historical": [
     {
@@ -138,7 +140,7 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
     "frequency": "daily",
     "observation_price_unit": "INR/metric quintal",
     "forecast_price_unit": "INR/kg",
-    "quantity_unit": "metric quintals/day (source period needs validation)",
+    "quantity_unit": "metric quintals/day",
     "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
     "prediction_interval": {
       "nominal_coverage": 0.8,
@@ -173,6 +175,7 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
 - **Method**: `GET`
 - **Path**: `/api/graphs/state-comparison`
 - **Description**: Compares onion prices across any combination of supported states (`AP`, `KA`, `MH`, `MP`) and price types.
+- Retail targets use their own historical price plus same-state wholesale, mandi modal, and arrival inputs. Wholesale targets use same-state mandi modal and arrivals; mandi modal targets use same-state arrivals. Unknown future covariates are independently forecast first.
 
 #### Query Parameters:
 | Parameter | Type | Required | Default | Allowed Values / Constraints | Description |
@@ -180,7 +183,7 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
 | `states` | string | No | `AP,KA,MH,MP` | Comma-separated: `AP`, `KA`, `MH`, `MP` | States to forecast and compare. |
 | `price_types` | string | No | `retail,wholesale,mandi_modal` | Comma-separated: `retail`, `wholesale`, `mandi_modal` | Price types to include. |
 | `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
-| `end_date` | date | Yes | — | `YYYY-MM-DD`; more than 180 days after latest observation returns an empty graph | Last date to display and forecast through. Actual observations stop at today; forecast rows start at today or the next day if an actual observation exists today. |
+| `end_date` | date | Yes | — | `YYYY-MM-DD`; requests beyond 180 days return the maximum supported forecast range | Requested last date. If beyond the limit, response includes forecasts only through `forecast_limit_date` and sets `forecast_truncated` to `true`. |
 | `threshold_rs_kg` | number | No | `44.0` | Greater than or equal to `0` | Chart reference threshold in INR/kg; echoed in the response. |
 
 #### Example Request:
@@ -237,7 +240,7 @@ GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start
     "frequency": "daily",
     "observation_price_unit": "INR/metric quintal",
     "forecast_price_unit": "INR/kg",
-    "quantity_unit": "metric quintals/day (source period needs validation)",
+    "quantity_unit": "metric quintals/day",
     "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
     "prediction_interval": {
       "nominal_coverage": 0.8,
@@ -266,121 +269,105 @@ GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start
 
 ---
 
-### 1.3 Graph 3: Supply, Consumption & Balance (Shortfall) Forecast
-*Endpoint for predicting quantity flows and estimated surplus / deficit.*
+### 1.3 Graph 3: AP Monthly Supply-Demand Balance Forecast
+*Endpoint for forecasting monthly AP production, consumption, and arrivals and deriving the supply-demand shortfall.*
 
 - **Method**: `GET`
 - **Path**: `/api/graphs/supply-balance`
-- **Description**: Forecasts `supply`, `consumption`, `arrival`, and `production` as independent univariate targets for each selected state. Returns their P10/P50/P90 forecasts in `quantity_forecast` and calculates shortfall as `supply - consumption` with conservative component bounds.
+- **Description**: Reads AP monthly quantities from the configured monthly dataset, forecasts production, consumption, and arrivals independently in tonnes/month, then derives shortfall with conservative component bounds. No separate supply or shortfall target is forecast.
 
 #### Query Parameters:
 | Parameter | Type | Required | Default | Allowed Values / Constraints | Description |
 |---|---|---|---|---|---|
-| `states` | string | No | `AP` | Comma-separated: `AP`, `KA`, `MH`, `MP` | States to calculate balance for. |
+| `states` | string | No | `AP` | `AP` only | AP is the only state in the monthly dataset. Other state codes receive HTTP 422. |
 | `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
-| `end_date` | date | Yes | — | `YYYY-MM-DD`; if more than 180 days after latest observation, returns an empty graph | Last date to display; the model forecasts through this date when within the supported horizon. |
+| `end_date` | date | Yes | — | `YYYY-MM-DD`; requests beyond 180 days return the maximum supported forecast range | Requested last date; monthly forecast points are returned through the latest month start within `forecast_limit_date`. |
 
 #### Formula & Logic:
-- **Supply**: The historical supply series is calculated as `arrival + production` and forecast as its own univariate target. Its forecast is independent of the separately forecast arrival and production series; the API does not calculate forecast supply by summing their forecast values.
-- **Consumption**: Historical daily consumption, forecast as a univariate series.
-- **Arrival**: Historical arrival values, forecast as a separate univariate target.
-- **Production**: Historical production values, forecast as a separate univariate target.
-- **Forecast response**: `quantity_forecast` contains one row per date, selected state, and metric. `metric` is `supply`, `consumption`, `arrival`, or `production`. Each row includes P10/P50/P90 fields and `predicted_quantity_mq_day`.
-- **Historical response**: `historical` uses the same metric labels and includes actual values for supply, consumption, arrival, and production.
-- **Shortfall Formula**: `Shortfall = Supply - Consumption`
-  - $P_{50} = \text{Supply } P_{50} - \text{Consumption } P_{50}$
-  - $P_{10} = \text{Supply } P_{10} - \text{Consumption } P_{90}$ (conservative lower bound)
-  - $P_{90} = \text{Supply } P_{90} - \text{Consumption } P_{10}$ (conservative upper bound)
-  - **Classification**: `potential_surplus` (if $P_{50} > 0$), `potential_shortfall` (if $P_{50} < 0$), or `near_balance` (if $P_{50} = 0$).
+- **Source data**: AP production, consumption, and monthly arrivals from the configured monthly CSV; all values are in tonnes/month.
+- **Forecast response**: `quantity_forecast` contains one row per month and metric (`production`, `consumption`, or `arrival`), with P10/P50/P90 quantity fields. The descriptive `*_tonnes_month` fields are provided alongside the legacy `*_mq_day` compatibility fields.
+- **Historical response**: `historical` contains the same three metrics and actual values in `actual_quantity_tonnes_month`, alongside the legacy `actual_quantity_mq_day` field.
+- **Shortfall Formula**: `Shortfall = Consumption - (Arrival + Production)`
+  - $P_{50} = \text{Consumption } P_{50} - \text{Arrival } P_{50} - \text{Production } P_{50}$
+  - $P_{10} = \text{Consumption } P_{10} - \text{Arrival } P_{90} - \text{Production } P_{90}$ (conservative lower bound)
+  - $P_{90} = \text{Consumption } P_{90} - \text{Arrival } P_{10} - \text{Production } P_{10}$ (conservative upper bound)
+  - Positive values and `potential_shortfall` mean demand exceeds estimated supply; negative values and `potential_surplus` mean estimated supply exceeds demand.
 
 #### Example Request:
 ```http
-GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-30
+GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-02
 ```
 
 #### Sample Output:
 ```json
 {
   "graph": "supply_demand_shortfall",
-  "title": "Onion Supply, Consumption and Shortfall Forecast",
+  "title": "Andhra Pradesh Monthly Supply-Demand Balance Forecast",
   "selected_states": ["AP"],
   "selected_state_names": ["Andhra Pradesh"],
-  "horizon_days": 46,
-  "quantity_unit": "metric_quintal/day",
+  "horizon_days": 32,
+  "quantity_unit": "tonnes/month",
   "historical": [
     {
       "date": "2026-10-01",
       "state": "AP",
       "state_name": "Andhra Pradesh",
-      "metric": "supply",
-      "actual_quantity_mq_day": 4520.0,
-      "unit": "metric_quintal/day"
+      "metric": "production",
+      "actual_quantity_tonnes_month": 53990.0,
+      "unit": "tonnes/month"
     }
   ],
   "quantity_forecast": [
     {
-      "date": "2026-10-16",
-      "state": "AP",
-      "state_name": "Andhra Pradesh",
-      "metric": "supply",
-      "predicted_quantity_mq_day": 4350.25,
-      "p10_mq_day": 3900.0,
-      "p50_mq_day": 4350.25,
-      "p90_mq_day": 4800.5,
-      "unit": "metric_quintal/day"
-    },
-    {
-      "date": "2026-10-16",
-      "state": "AP",
-      "state_name": "Andhra Pradesh",
-      "metric": "consumption",
-      "predicted_quantity_mq_day": 4600.0,
-      "p10_mq_day": 4400.0,
-      "p50_mq_day": 4600.0,
-      "p90_mq_day": 4850.0,
-      "unit": "metric_quintal/day"
-    },
-    {
-      "date": "2026-10-16",
-      "state": "AP",
-      "state_name": "Andhra Pradesh",
-      "metric": "arrival",
-      "predicted_quantity_mq_day": 1200.0,
-      "p10_mq_day": 1100.0,
-      "p50_mq_day": 1200.0,
-      "p90_mq_day": 1300.0,
-      "unit": "metric_quintal/day"
-    },
-    {
-      "date": "2026-10-16",
+      "date": "2026-11-01",
       "state": "AP",
       "state_name": "Andhra Pradesh",
       "metric": "production",
-      "predicted_quantity_mq_day": 3320.0,
-      "p10_mq_day": 3200.0,
-      "p50_mq_day": 3320.0,
-      "p90_mq_day": 3450.0,
-      "unit": "metric_quintal/day"
+      "predicted_quantity_tonnes_month": 54017.0,
+      "p10_tonnes_month": 51316.15,
+      "p50_tonnes_month": 54017.0,
+      "p90_tonnes_month": 56717.85,
+      "unit": "tonnes/month"
+    },
+    {
+      "date": "2026-11-01",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "consumption",
+      "predicted_quantity_tonnes_month": 71695.83,
+      "p10_tonnes_month": 68111.0385,
+      "p50_tonnes_month": 71695.83,
+      "p90_tonnes_month": 75280.6215,
+      "unit": "tonnes/month"
+    },
+    {
+      "date": "2026-11-01",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "arrival",
+      "predicted_quantity_tonnes_month": 4856.3269,
+      "p10_tonnes_month": 4613.5106,
+      "p50_tonnes_month": 4856.3269,
+      "p90_tonnes_month": 5099.1433,
+      "unit": "tonnes/month"
     }
   ],
   "balance_forecast": [
     {
-      "date": "2026-10-16",
+      "date": "2026-11-01",
       "state": "AP",
       "state_name": "Andhra Pradesh",
-      "shortfall_p10_metric_quintal_day": -950.0,
-      "shortfall_p50_metric_quintal_day": -249.75,
-      "shortfall_p90_metric_quintal_day": 400.5,
+      "shortfall_p10_tonnes_month": 6294.0504,
+      "shortfall_p50_tonnes_month": 12822.5031,
+      "shortfall_p90_tonnes_month": 19350.9609,
       "classification": "potential_shortfall"
     }
   ],
-  "balance_formula": "supply - consumption",
+  "balance_formula": "consumption - (arrival + production)",
   "metadata": {
     "model": "amazon/chronos-2",
-    "frequency": "daily",
-    "observation_price_unit": "INR/metric quintal",
-    "forecast_price_unit": "INR/kg",
-    "quantity_unit": "metric quintals/day (source period needs validation)",
+    "frequency": "monthly",
+    "quantity_unit": "tonnes/month",
     "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
     "prediction_interval": {
       "nominal_coverage": 0.8,
@@ -392,22 +379,18 @@ GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-
     }
   },
   "warnings": [
-    "Latest observation is 2026-10-15 (12 day(s) behind the server date).",
-    "Supply is calculated as arrivals + production as requested; confirm that arrivals and production are compatible flows and do not double-count the same supply.",
-    "The source production/consumption series repeat across many daily rows; verify their real reporting frequency before interpreting daily forecasts.",
-    "Shortfall is supply minus consumption: negative values indicate demand exceeds supply; positive values indicate surplus.",
+    "Shortfall = Consumption - (Arrival + Production). Positive values indicate potential shortfall; negative values indicate potential surplus.",
     "Shortfall P10/P90 combine component quantiles conservatively and are not a calibrated joint prediction interval."
   ],
   "saved_to_sqlite": {
     "run_id": 3,
     "generated_at": "2026-10-27T18:10:00Z",
-    "saved_values": 230,
+    "saved_values": 4,
     "graph_code": "graph3_supply_balance"
   },
-  "last_observation_date": "2026-10-15",
-  "data_staleness_days": 12,
-  "forecast_start_date": "2026-10-16",
-  "forecast_end_date": "2026-11-30"
+  "last_observation_date": "2026-10-01",
+  "forecast_start_date": "2026-11-01",
+  "forecast_end_date": "2026-11-01"
 }
 ```
 

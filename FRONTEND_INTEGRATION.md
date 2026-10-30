@@ -10,12 +10,11 @@ only when the browser must call this API directly; CORS does not protect the tok
 For remote access, use HTTPS and a firewall/reverse proxy. See [API.md](API.md) for
 token generation and server setup.
 
-All graph endpoints require inclusive `start_date` and `end_date` values in `YYYY-MM-DD` format. The model forecasts from the day after the latest stored observation through `end_date`; `end_date` must be no more than 180 days after the latest observation. The response includes calculated `horizon_days`; it is not a request parameter. For Graph 1 and Graph 2, actual rows are returned through `actual_end_date` (the earlier of `end_date` and today), and forecast rows are returned from today through `end_date`. If today's actual observation exists, forecasts start the next day to avoid overlapping actual and predicted values. If `end_date` is before today, these graphs return actual rows only. Graph 3 retains the full requested-range behavior. Forecast price outputs are in INR/kg. The SQLite observations table retains historical prices in INR/metric quintal; actual-history values in the graph API are converted at response time to INR/kg so chart lines are comparable. Forecast price quantiles are converted to INR/kg and saved to SQLite.
+All graph endpoints require inclusive `start_date` and `end_date` values in `YYYY-MM-DD` format. The model supports a maximum 180-day forecast horizon from the latest stored observation. If a request's `end_date` is further ahead, the API returns the maximum supported forecast range rather than rejecting the request. The response includes `horizon_days`, `requested_end_date`, `forecast_limit_date`, `forecast_truncated`, and the actual `forecast_end_date`. For Graph 1 and Graph 2, actual rows are returned through `actual_end_date` (the earlier of `end_date` and today), and forecast rows are returned from today through the effective limit. If today's actual observation exists, forecasts start the next day to avoid overlapping actual and predicted values. If `end_date` is before today, these graphs return actual rows only. Graph 3 returns monthly points up to the last month start inside the effective 180-day limit. Forecast price outputs are in INR/kg. The SQLite observations table retains historical prices in INR/metric quintal; actual-history values in the graph API are converted at response time to INR/kg so chart lines are comparable. Forecast price quantiles are converted to INR/kg and saved to SQLite.
 
 The 180-day limit is based on the remote API database's `last_observation_date`, not
-the selected display-range length. If the warning says the forecast horizon exceeds
-the cap for a short selection, check `GET /api/ingestion/status` on the remote API;
-its history may be stale compared with the local API.
+the selected display-range length. When a request is truncated, the API warning and
+`forecast_limit_date` show the latest date supported by that backend's current data.
 
 ## Graph 1 — AP prices
 
@@ -27,12 +26,13 @@ its history may be stale compared with the local API.
 - `historical`: `date`, `state`, `price_type`, `actual_price_rs_kg`.
 - `forecast`: `date`, `state`, `price_type`, `latest_actual_date`, `latest_actual_price_rs_kg`, `predicted_price_rs_kg`, `change_rs_kg`, `change_percent`, `change_direction`, `p10_rs_kg`, `p50_rs_kg`, `p90_rs_kg`, `prediction_interval_width_rs_kg`, `interval_width_pct_of_median`.
 - Top-level date/status fields include `visible_start_date`, `visible_end_date`, `actual_end_date`, `requested_end_date`, `last_observation_date`, `data_staleness_days`, `forecast_start_date`, `forecast_end_date`, and `warnings`.
+- If `forecast_truncated` is true, the chart should show the warning and use the returned forecast rows through `forecast_limit_date`; `forecast_end_date` is the last actual forecast point.
 - `saved_to_sqlite`: run ID and number of saved quantile rows.
 
 Target logic:
-- retail uses past AP retail, wholesale and mandi modal; future wholesale and mandi modal values are first forecast as covariates.
-- wholesale uses only its own past series.
-- mandi modal uses only its own past series.
+- retail uses past AP retail, wholesale, mandi modal, and arrivals; unknown future covariates are forecast first.
+- wholesale uses past AP wholesale, mandi modal, and arrivals; unknown future covariates are forecast first.
+- mandi modal uses past AP mandi modal and arrivals; unknown future arrivals are forecast first.
 
 ## Graph 2 — state comparison
 
@@ -45,16 +45,20 @@ Target logic:
 - Actual rows stop at today; forecast rows begin today or the next day if today's actual exists, and continue through `end_date`.
 - Price `forecast` rows include the latest observed price/date, median prediction, absolute/percentage change and direction, P10/P50/P90, and prediction-interval width fields (same shape as Graph 1).
 - Only selected states and series are returned and saved.
-- Retail uses each state's own retail/wholesale/mandi history; wholesale and mandi modal each use only their own history.
+- Retail uses its own target history and same-state wholesale, mandi modal, and arrival inputs; wholesale uses same-state mandi modal and arrivals; mandi modal uses same-state arrivals. Future covariates are forecast independently for that state.
 
-## Graph 3 — supply / consumption / shortfall
+## Graph 3 — AP monthly production / consumption / arrivals / shortfall
 
 `GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-30`
 
-- `quantity_forecast`: `metric` is `supply` or `consumption`, with P10/P50/P90 in `metric_quintal/day`.
-- `balance_forecast`: `shortfall_p50_metric_quintal_day` and bounds; formula is `supply - consumption`. Negative = potential shortfall; positive = potential surplus.
-- Supply is created from historical arrival + production and forecast as a univariate target. Consumption is forecast as a separate univariate target. Shortfall is calculated, not independently forecast.
+- `quantity_forecast`: `metric` is `production`, `consumption`, or `arrival`, with P10/P50/P90 in tonnes/month.
+- `balance_forecast`: `shortfall_p50_tonnes_month` and bounds. Formula is `consumption - (arrival + production)`. Positive = potential shortfall; negative = potential surplus.
+- Requests beyond the model's 180-day maximum are capped and return the supported monthly forecast points with `forecast_truncated: true` and a warning.
+- Each monthly series is forecast independently; the shortfall is calculated from their forecasts and is not an independent model target.
+- The endpoint accepts AP only. Dates remain `YYYY-MM-DD`; forecast points use month-start dates. The existing 180-day maximum request horizon is preserved.
 - Top-level response includes `historical`, `balance_formula`, `warnings`, `metadata`, `saved_to_sqlite`, date/staleness fields, and calculated `horizon_days`.
+
+The configured daily and monthly CSV sources are synchronized into SQLite tables on graph requests. Set `ONION_DAILY_PRICE_DATA_PATH` and `ONION_AP_MONTHLY_DATA_PATH` in `.env` if the supplied local file paths differ.
 
 ## Forecast persistence endpoints
 

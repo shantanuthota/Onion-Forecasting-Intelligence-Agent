@@ -1,5 +1,6 @@
 """API contract tests using a fake predictor; no model weights/network needed."""
 from __future__ import annotations
+import os
 import sys
 from pathlib import Path
 from datetime import date
@@ -21,7 +22,8 @@ class FakeChronosPipeline:
     calls = []
     def predict_df(self, df, future_df, id_column, timestamp_column, target,
                    prediction_length, quantile_levels, freq):
-        self.calls.append({"columns": list(df.columns), "future_columns": list(future_df.columns), "target": target})
+        self.calls.append({"columns": list(df.columns), "future_columns": list(future_df.columns),
+                           "target": target, "freq": freq})
         recent = float(pd.to_numeric(df[target], errors="coerce").dropna().iloc[-1])
         rows = []
         for i, ts in enumerate(future_df[timestamp_column]):
@@ -34,6 +36,31 @@ class FakeChronosPipeline:
 
 def client_with_fake(monkeypatch, tmp_path):
     monkeypatch.setattr(history_store, "DB_PATH", tmp_path / "test.sqlite3")
+    daily_path = tmp_path / "daily_prices.csv"
+    daily_rows = []
+    for day_index, stamp in enumerate(("2026-10-23", "2026-10-24", "2026-10-25")):
+        row = {"date": stamp}
+        for state_index, state in enumerate(history_store.STATE_CODES):
+            base = 2000 + state_index * 100 + day_index
+            row.update({
+                f"{state}_retail_rs_kg": base / 100,
+                f"{state}_wholesale_rs_kg": (base - 500) / 100,
+                f"{state}_mandi_modal_rs_kg": (base - 800) / 100,
+                f"{state}_arrival_t_day": 10 + state_index + day_index,
+            })
+        daily_rows.append(row)
+    pd.DataFrame(daily_rows).to_csv(daily_path, index=False)
+    monthly_path = tmp_path / "monthly_ap.csv"
+    pd.DataFrame([
+        {"month_start": "Aug-26", "production_t_month": 52000,
+         "consumption_t_month": 69000, "arrival_t_month": 4500},
+        {"month_start": "Sep-26", "production_t_month": 53000,
+         "consumption_t_month": 70000, "arrival_t_month": 4700},
+        {"month_start": "Oct-26", "production_t_month": 54000,
+         "consumption_t_month": 71000, "arrival_t_month": 4900},
+    ]).to_csv(monthly_path, index=False)
+    monkeypatch.setattr(history_store, "DAILY_PRICE_CSV_PATH", daily_path)
+    monkeypatch.setattr(history_store, "AP_MONTHLY_CSV_PATH", monthly_path)
     monkeypatch.setattr(main, "get_pipeline", lambda: FakeChronosPipeline())
     monkeypatch.setattr(main, "date", FixedDate)
     monkeypatch.setenv("API_BEARER_TOKEN", "test-api-token")
@@ -104,15 +131,19 @@ def test_graph1_retail_uses_only_requested_context_and_converts_forecast(monkeyp
     assert body["unit"] == "INR/kg"
     assert body["threshold_rs_kg"] == 44.0
     assert body["price_types"] == ["retail"]
-    assert body["model_history_rows"] == 1760
+    assert body["model_history_rows"] == 3
     assert body["requested_end_date"] == "2026-11-02"
     assert body["visible_end_date"] == "2026-11-02"
     assert body["actual_end_date"] == "2026-10-29"
     assert body["forecast_end_date"] == "2026-11-02"
-    # Retail target context contains only date/id, AP retail, AP wholesale and AP mandi modal.
+    # Retail target context uses only AP retail, wholesale, mandi modal and arrivals.
     retail_calls = [c for c in FakeChronosPipeline.calls if c["target"] == "AP_retail_rs_per_metric_quintal"]
     assert len(retail_calls) == 1
-    assert set(retail_calls[0]["columns"]) == {"item_id", "timestamp", "AP_retail_rs_per_metric_quintal", "AP_wholesale_rs_per_metric_quintal", "AP_mandi_modal_rs_per_metric_quintal"}
+    assert set(retail_calls[0]["columns"]) == {
+        "item_id", "timestamp", "AP_retail_rs_per_metric_quintal",
+        "AP_wholesale_rs_per_metric_quintal", "AP_mandi_modal_rs_per_metric_quintal",
+        "AP_arrival_metric_quintal",
+    }
     # Forecast median is converted from ₹/metric quintal to ₹/kg.
     assert body["forecast"][0]["predicted_price_rs_kg"] < 100
     assert body["saved_to_sqlite"]["saved_values"] == 5
@@ -129,6 +160,50 @@ def test_graph1_retail_uses_only_requested_context_and_converts_forecast(monkeyp
     assert latest is not None and latest["forecast_values"][0]["unit"] == "INR/kg"
 
 
+def test_new_graph_datasets_are_loaded_into_sqlite(monkeypatch, tmp_path):
+    client_with_fake(monkeypatch, tmp_path)
+
+    daily = history_store.load_daily_price_history()
+    monthly = history_store.load_ap_monthly_history()
+
+    assert len(daily) == 3
+    assert daily["timestamp"].max().date().isoformat() == "2026-10-25"
+    assert daily.iloc[0]["AP_retail_rs_per_metric_quintal"] == 2000
+    assert daily.iloc[0]["AP_arrival_metric_quintal"] == 100
+    assert len(monthly) == 3
+    assert monthly.iloc[-1]["month_start"].date().isoformat() == "2026-10-01"
+    assert monthly.iloc[-1]["production_t_month"] == 54000
+
+    with history_store.connect() as conn:
+        daily_count = conn.execute("SELECT COUNT(*) FROM daily_price_observations").fetchone()[0]
+        monthly_count = conn.execute("SELECT COUNT(*) FROM ap_monthly_observations").fetchone()[0]
+    assert daily_count == 3
+    assert monthly_count == 3
+
+
+def test_dash_ingestion_updates_survive_graph_dataset_reload(monkeypatch, tmp_path):
+    client_with_fake(monkeypatch, tmp_path)
+    history_store.load_daily_price_history()
+    history_store.load_ap_monthly_history()
+
+    result = history_store.upsert_dash_graph_observations({
+        "2026-10-26": {
+            history_store.PRICE_COLUMNS["AP"]["retail"]: 4100.0,
+            history_store.QUANTITY_COLUMNS["AP"]["arrival"]: 130.0,
+        },
+    })
+
+    daily = history_store.load_daily_price_history()
+    monthly = history_store.load_ap_monthly_history()
+    latest_daily = daily.loc[daily["timestamp"] == pd.Timestamp("2026-10-26")].iloc[0]
+    october = monthly.loc[monthly["month_start"] == pd.Timestamp("2026-10-01")].iloc[0]
+    assert result["rows_inserted"] == 1
+    assert latest_daily["AP_retail_rs_per_metric_quintal"] == 4100.0
+    assert latest_daily["AP_arrival_metric_quintal"] == 130.0
+    assert october["production_t_month"] == 54000
+    assert october["arrival_t_month"] == 46.0
+
+
 def test_graph1_two_month_forecast_is_within_limit_with_current_history(monkeypatch, tmp_path):
     client = client_with_fake(monkeypatch, tmp_path)
     response = client.get(
@@ -138,15 +213,33 @@ def test_graph1_two_month_forecast_is_within_limit_with_current_history(monkeypa
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["last_observation_date"] == "2026-10-26"
-    assert body["horizon_days"] == 64
+    assert body["last_observation_date"] == "2026-10-25"
+    assert body["horizon_days"] == 65
     assert len(body["forecast"]) == 62
     assert body["forecast"][0]["date"] == "2026-10-29"
     assert body["forecast"][-1]["date"] == "2026-12-29"
     assert not any("180-day limit" in warning for warning in body["warnings"])
 
 
-def test_graph1_over_limit_warning_explains_stale_history(monkeypatch, tmp_path):
+def test_graph1_reported_url_dates_use_current_daily_dataset(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    response = client.get(
+        "/api/graphs/ap-retail?start_date=2026-09-29&end_date=2026-11-29&price_types=retail,wholesale,mandi_modal",
+        headers={"Authorization": f"Bearer {os.getenv('API_BEARER_TOKEN')}"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["last_observation_date"] == "2026-10-25"
+    assert body["horizon_days"] == 35
+    assert body["forecast_start_date"] == "2026-10-29"
+    assert body["forecast_end_date"] == "2026-11-29"
+    assert body["historical"]
+    assert len(body["forecast"]) == 32 * 3
+    assert body["saved_to_sqlite"]["saved_values"] == 32 * 3
+
+
+def test_graph1_over_limit_request_returns_maximum_forecast(monkeypatch, tmp_path):
     client = client_with_fake(monkeypatch, tmp_path)
     history = main.get_data().copy()
     history["timestamp"] = pd.to_datetime(history["timestamp"]) - pd.Timedelta(days=150)
@@ -159,17 +252,13 @@ def test_graph1_over_limit_warning_explains_stale_history(monkeypatch, tmp_path)
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["horizon_days"] == 214
-    assert body["forecast"] == []
-    range_warnings = [
-        warning for warning in body["warnings"]
-        if warning.startswith("Forecast requires")
-    ]
-    assert range_warnings == [
-        "Forecast requires 214 days from the latest observation (2026-05-29) "
-        "through requested end_date 2026-12-29, exceeding the 180-day limit. "
-        "no graph data was returned and no forecast was saved."
-    ]
+    assert body["horizon_days"] == 180
+    assert body["forecast_truncated"] is True
+    assert body["forecast_limit_date"] == "2026-11-24"
+    assert body["forecast_end_date"] == "2026-11-24"
+    assert body["forecast"][-1]["date"] == "2026-11-24"
+    assert body["requested_end_date"] == "2026-12-29"
+    assert any("maximum supported date" in warning for warning in body["warnings"])
 
 
 def test_graph1_all_three_price_series(monkeypatch, tmp_path):
@@ -183,6 +272,22 @@ def test_graph1_all_three_price_series(monkeypatch, tmp_path):
     assert len(body["forecast"]) == 264
     assert set(body["price_types"]) == {"retail", "wholesale", "mandi_modal"}
     assert body["saved_to_sqlite"]["saved_values"] == 264
+    expected_contexts = {
+        "AP_wholesale_rs_per_metric_quintal": {
+            "item_id", "timestamp", "AP_wholesale_rs_per_metric_quintal",
+            "AP_mandi_modal_rs_per_metric_quintal", "AP_arrival_metric_quintal",
+        },
+        "AP_mandi_modal_rs_per_metric_quintal": {
+            "item_id", "timestamp", "AP_mandi_modal_rs_per_metric_quintal",
+            "AP_arrival_metric_quintal",
+        },
+    }
+    for target, expected in expected_contexts.items():
+        target_call = next(
+            call for call in FakeChronosPipeline.calls
+            if call["target"] == target and "AP_arrival_metric_quintal" in call["columns"]
+        )
+        assert set(target_call["columns"]) == expected
 
 
 def test_graph2_only_selected_states_and_series(monkeypatch, tmp_path):
@@ -203,6 +308,16 @@ def test_graph2_only_selected_states_and_series(monkeypatch, tmp_path):
     assert body["visible_end_date"] == "2026-11-09"
     assert body["actual_end_date"] == "2026-10-29"
     assert body["forecast_end_date"] == "2026-11-09"
+    ka_retail = next(
+        call for call in FakeChronosPipeline.calls
+        if call["target"] == "KA_retail_rs_per_metric_quintal"
+    )
+    assert set(ka_retail["columns"]) == {
+        "item_id", "timestamp", "KA_retail_rs_per_metric_quintal",
+        "KA_wholesale_rs_per_metric_quintal", "KA_mandi_modal_rs_per_metric_quintal",
+        "KA_arrival_metric_quintal",
+    }
+    assert not any(column.startswith(("AP_", "MP_", "MH_")) for column in ka_retail["columns"])
     override = client.get(
         "/api/graphs/state-comparison?states=KA&price_types=retail&start_date=2026-10-27&end_date=2026-11-09&threshold_rs_kg=50",
         headers={"Authorization": "Bearer test-api-token"},
@@ -237,16 +352,72 @@ def test_graph3_supply_consumption_and_shortfall(monkeypatch, tmp_path):
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    assert len(body["quantity_forecast"]) == 14
+    assert len(body["quantity_forecast"]) == 3
     assert {r["metric"] for r in body["quantity_forecast"]} == {
-        "supply", "consumption", "arrival", "production"
+        "consumption", "arrival", "production"
     }
-    assert len(body["balance_forecast"]) == 7
-    assert body["balance_formula"] == "supply - consumption"
-    assert body["saved_to_sqlite"]["saved_values"] == 21
-    supply_calls = [c for c in FakeChronosPipeline.calls if c["target"] == "AP_supply_metric_quintal_per_day"]
-    assert len(supply_calls) == 1
-    assert set(supply_calls[0]["columns"]) == {"item_id", "timestamp", "AP_supply_metric_quintal_per_day"}
+    assert len(body["balance_forecast"]) == 1
+    assert body["balance_formula"] == "consumption - (arrival + production)"
+    assert body["quantity_unit"] == "tonnes/month"
+    assert body["saved_to_sqlite"]["saved_values"] == 4
+    assert {call["target"] for call in FakeChronosPipeline.calls} == {
+        "production_t_month", "consumption_t_month", "arrival_t_month"
+    }
+    assert all(call["freq"] == "MS" for call in FakeChronosPipeline.calls)
+    assert all(
+        set(call["columns"]) == {"item_id", "timestamp", call["target"]}
+        for call in FakeChronosPipeline.calls
+    )
+    assert body["balance_forecast"][0]["shortfall_p50_tonnes_month"] == round(
+        next(row["predicted_quantity_tonnes_month"] for row in body["quantity_forecast"] if row["metric"] == "consumption")
+        - next(row["predicted_quantity_tonnes_month"] for row in body["quantity_forecast"] if row["metric"] == "arrival")
+        - next(row["predicted_quantity_tonnes_month"] for row in body["quantity_forecast"] if row["metric"] == "production"),
+        4,
+    )
+
+
+def test_graph3_is_ap_only_and_returns_maximum_monthly_forecast(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer test-api-token"}
+    unsupported = client.get(
+        "/api/graphs/supply-balance?states=KA&start_date=2026-10-01&end_date=2026-11-02",
+        headers=headers,
+    )
+    assert unsupported.status_code == 422
+
+    too_far = client.get(
+        "/api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2027-04-15",
+        headers=headers,
+    )
+    assert too_far.status_code == 200, too_far.text
+    body = too_far.json()
+    assert body["horizon_days"] == 180
+    assert body["forecast_truncated"] is True
+    assert body["requested_end_date"] == "2027-04-15"
+    assert body["forecast_limit_date"] == "2027-03-30"
+    assert body["forecast_end_date"] == "2027-03-01"
+    assert len(body["balance_forecast"]) == 5
+    assert any("maximum supported date" in warning for warning in body["warnings"])
+
+
+def test_graph2_year_request_returns_maximum_forecast_for_each_state(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    response = client.get(
+        "/api/graphs/state-comparison?states=AP,KA,MH,MP&price_types=retail&start_date=2026-04-30&end_date=2027-04-30",
+        headers={"Authorization": f"Bearer {os.getenv('API_BEARER_TOKEN')}"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["last_observation_date"] == "2026-10-25"
+    assert body["horizon_days"] == 180
+    assert body["forecast_truncated"] is True
+    assert body["forecast_limit_date"] == "2027-04-23"
+    assert body["forecast_end_date"] == "2027-04-23"
+    assert len(body["forecast"]) == 177 * 4
+    assert {row["state"] for row in body["forecast"]} == {"AP", "KA", "MH", "MP"}
+    assert body["requested_end_date"] == "2027-04-30"
+    assert any("maximum supported date" in warning for warning in body["warnings"])
 
 
 def test_graph1_and_graph2_split_actuals_and_forecasts_at_today(monkeypatch, tmp_path):
@@ -261,10 +432,6 @@ def test_graph1_and_graph2_split_actuals_and_forecasts_at_today(monkeypatch, tmp
             "/api/graphs/state-comparison?states=AP&price_types=retail&start_date=2026-10-01&end_date=2026-11-09",
             "forecast",
         ),
-        (
-            "/api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2027-05-01",
-            ("historical", "quantity_forecast", "balance_forecast"),
-        ),
     ]
 
     for path, forecast_field in requests[:2]:
@@ -277,15 +444,6 @@ def test_graph1_and_graph2_split_actuals_and_forecasts_at_today(monkeypatch, tmp
         assert body["actual_end_date"] == "2026-10-29"
         assert min(row["date"] for row in body[forecast_field]) == "2026-10-29"
         assert max(row["date"] for row in body[forecast_field]) == expected_end_date
-
-    path, empty_fields = requests[2]
-    response = client.get(path, headers=headers)
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert all(body[field] == [] for field in empty_fields)
-    assert body["saved_to_sqlite"] is None
-    assert any("no graph data was returned" in warning for warning in body["warnings"])
-
 
 def test_graph_returns_historical_only_when_no_future_days_remain(monkeypatch, tmp_path):
     client = client_with_fake(monkeypatch, tmp_path)

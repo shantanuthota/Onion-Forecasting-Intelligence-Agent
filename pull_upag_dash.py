@@ -281,6 +281,8 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
     session = dash_client.new_session()
     try:
         history_store.ensure_store_ready()
+        if not args.dry_run:
+            history_store.ensure_graph_datasets_ready()
         for state in args.states:
             try:
                 outcome, updates, corrections, raw_rows = pull_state(state, from_iso, to_iso, session,
@@ -305,6 +307,7 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         gap_dates: list[str] = []
         upsert_result = None
         gapfill_result = None
+        graph_result = None
         if not args.dry_run:
             combined: dict[str, dict[str, float]] = {}
             for updates in state_updates.values():
@@ -324,6 +327,15 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
                                                                         source=SOURCE_GAPFILL)
                 ingestion["gap_filled"] += gapfill_result.gap_filled
                 ingestion["inserted"] += gapfill_result.gap_filled
+            if combined or gap_dates:
+                graph_result = history_store.upsert_dash_graph_observations(
+                    combined, gap_dates=gap_dates, update_existing=update_existing)
+                missing_months = graph_result["monthly_arrival_months_missing"]
+                if missing_months:
+                    logger.warning(
+                        "AP monthly arrival totals were not updated because monthly source rows are missing: %s",
+                        ", ".join(missing_months),
+                    )
             corrections_written = 0
             for state, entry in all_corrections:
                 line = {"ingested_utc": entry["ingested_utc"], "state": state, "date": entry["date"],
@@ -341,8 +353,12 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
                 unchanged=ingestion["unchanged"], latest_observation=latest,
                 message=f"{len(successful)}/{len(args.states)} states ok; "
                         f"corrections_logged={corrections_written}; gap_filled={ingestion['gap_filled']}; "
+                        f"graph_daily_rows_inserted={graph_result['rows_inserted'] if graph_result else 0}; "
+                        f"graph_monthly_arrivals_updated="
+                        f"{graph_result['monthly_arrivals_updated'] if graph_result else 0}; "
                         f"window={from_iso}..{to_iso}",
             )
+            ingestion["graph_datasets"] = graph_result
         else:
             for _state, entry in all_corrections:
                 entry["applied"] = False

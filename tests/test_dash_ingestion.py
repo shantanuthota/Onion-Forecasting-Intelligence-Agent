@@ -331,6 +331,23 @@ def _isolate_paths(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(history_store, "ensure_store_ready", lambda: None)
     monkeypatch.setenv("UPAG_DASH_SNAPSHOTS", "0")
     monkeypatch.setenv("UPAG_DASH_ENABLED", "1")
+    with history_store.connect() as conn:
+        history_store._create_schema(conn)
+        daily_columns = history_store.DAILY_GRAPH_COLUMNS
+        quoted_columns = ",".join(f'"{column}"' for column in daily_columns)
+        source_rows = conn.execute(
+            f'SELECT {quoted_columns} FROM observations ORDER BY timestamp').fetchall()
+        placeholders = ",".join("?" for _ in daily_columns)
+        conn.executemany(
+            f'INSERT OR REPLACE INTO daily_price_observations ({quoted_columns}) '
+            f'VALUES ({placeholders})',
+            [tuple(row) for row in source_rows],
+        )
+        conn.execute(
+            """INSERT OR REPLACE INTO ap_monthly_observations
+            (month_start, production_t_month, consumption_t_month, arrival_t_month)
+            VALUES('2026-10-01', 52000, 69000, 3000)"""
+        )
 
 
 def test_run_once_dry_run_writes_nothing(tmp_path, monkeypatch):
@@ -370,6 +387,35 @@ def test_run_once_appends_yesterday(tmp_path, monkeypatch):
     assert latest["source"] == "upag_dash_6h" and latest["status"] == "success"
     assert latest["inserted"] == 1
     assert not (tmp_path / "pull.lock").exists()
+
+
+def test_run_once_writes_graph_tables_in_their_dataset_units(tmp_path, monkeypatch):
+    seed_history(tmp_path, monkeypatch)
+    _isolate_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(pull_upag_dash, "today_ist", lambda: dt.date(2026, 10, 28))
+    ap_rows = [
+        make_row("AP", "27 Oct 2026", "Retail Prices", 4100.0),
+        make_row("AP", "27 Oct 2026", "Mandi Arrivals", 2.0,
+                 main_category="Arrivals", uom="Tonnes"),
+    ]
+    _stub_fetch(monkeypatch, {"AP": ap_rows})
+
+    exit_code = pull_upag_dash.main(["--once", "--states", "AP"])
+    assert exit_code == 0
+
+    with history_store.connect() as conn:
+        daily = conn.execute(
+            'SELECT * FROM daily_price_observations WHERE timestamp=?', ("2026-10-27",)
+        ).fetchone()
+        monthly = conn.execute(
+            'SELECT * FROM ap_monthly_observations WHERE month_start=?', ("2026-10-01",)
+        ).fetchone()
+    assert daily["AP_retail_rs_per_metric_quintal"] == pytest.approx(4100.0)
+    assert daily["AP_arrival_metric_quintal"] == pytest.approx(20.0)
+    assert daily["MP_retail_rs_per_metric_quintal"] == pytest.approx(4000.0)
+    assert monthly["production_t_month"] == pytest.approx(52000.0)
+    assert monthly["consumption_t_month"] == pytest.approx(69000.0)
+    assert monthly["arrival_t_month"] == pytest.approx(3002.0)
 
 
 def test_run_once_state_failure_isolation(tmp_path, monkeypatch):

@@ -128,10 +128,18 @@ def section_heading(title: str, subtitle: str) -> None:
     st.markdown(f'<div class="section-title">{title}</div><div class="section-subtitle">{subtitle}</div>', unsafe_allow_html=True)
 
 
-def date_range_control(key: str, label: str) -> tuple[date, date] | None:
+def date_range_control(
+    key: str,
+    label: str,
+    start_days_before: int = 30,
+    end_days_after: int = 30,
+) -> tuple[date, date] | None:
     selected = st.date_input(
         label,
-        value=(date.today() - timedelta(days=30), date.today() + timedelta(days=30)),
+        value=(
+            date.today() - timedelta(days=start_days_before),
+            date.today() + timedelta(days=end_days_after),
+        ),
         key=key,
     )
     if not isinstance(selected, tuple) or len(selected) != 2:
@@ -432,37 +440,33 @@ else:
 st.markdown('<hr class="section-rule"/>', unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Graph 3 — forecast supply (arrivals + production) and consumption, then derive shortfall.
+# Graph 3 — forecast monthly AP production, consumption and arrivals, then derive shortfall.
 # ---------------------------------------------------------------------------
-section_heading("Demand, supply and shortfall", "Chronos-2 forecasts Supply = Arrivals + Production and Consumption separately; Shortfall = Supply − Consumption")
-st.warning("Supply is defined per the requested logic as arrivals + production. Confirm the quantities share compatible time periods and that this does not double-count the same supply flow.")
-g3a, g3b = st.columns([1.35, 1.65])
-with g3a:
-    qty_states = st.multiselect("States for quantity outlook", options=list(STATE_LABELS), default=["AP"], format_func=lambda code: STATE_LABELS[code], key="g3_states")
-with g3b:
-    st.caption("Only Supply and Consumption are forecast targets. Arrivals and Production are combined into Supply before forecasting.")
-range3 = date_range_control("g3_date_range", "Date range")
+section_heading("AP monthly supply-demand balance", "Monthly production, consumption and arrivals forecasts · Shortfall = Consumption − (Arrival + Production)")
+st.caption("Monthly Andhra Pradesh quantities are shown in tonnes/month. Positive shortfall values indicate potential demand exceeding supply.")
+range3 = date_range_control(
+    "g3_monthly_date_range",
+    "Monthly date range",
+    start_days_before=365,
+    end_days_after=180,
+)
 run3 = st.button("Update supply / demand outlook", type="primary", key="g3_run")
 if run3:
     st.session_state["g3_started"] = True
 if run3 or st.session_state.get("g3_started", False):
-    if not qty_states:
-        st.session_state["g3_error"] = "Select at least one state."
-        st.session_state.pop("g3_payload", None)
-    else:
-        with st.spinner("Forecasting Supply and Consumption with Chronos-2..."):
-            try:
-                st.session_state["g3_payload"] = fetch_graph(
-                    "/api/graphs/supply-balance",
-                    {
-    "states": ",".join(qty_states),
-    "start_date": range3[0].isoformat(),
-    "end_date": range3[1].isoformat(),
-},
-                )
-                st.session_state["g3_error"] = None
-            except Exception as exc:
-                st.session_state["g3_error"] = str(exc)
+    with st.spinner("Forecasting monthly AP production, consumption and arrivals with Chronos-2..."):
+        try:
+            st.session_state["g3_payload"] = fetch_graph(
+                "/api/graphs/supply-balance",
+                {
+                    "states": "AP",
+                    "start_date": range3[0].isoformat(),
+                    "end_date": range3[1].isoformat(),
+                },
+            )
+            st.session_state["g3_error"] = None
+        except Exception as exc:
+            st.session_state["g3_error"] = str(exc)
 if st.session_state.get("g3_error"):
     st.error(st.session_state["g3_error"])
 payload3 = st.session_state.get("g3_payload")
@@ -472,36 +476,137 @@ if payload3:
     qpred = pd.DataFrame(payload3.get("quantity_forecast", []))
     bpred = pd.DataFrame(payload3.get("balance_forecast", []))
     if not qhist.empty and not qpred.empty:
+        latest_actuals = (
+            qhist.assign(_date=pd.to_datetime(qhist["date"]))
+            .sort_values("_date")
+            .groupby("metric", as_index=False)
+            .tail(1)
+            .set_index("metric")
+        )
+        latest_balance = bpred.loc[pd.to_datetime(bpred["date"]).idxmax()] if not bpred.empty else None
+        metric_columns = st.columns(4)
+        for column, metric, label in zip(
+            metric_columns,
+            ("production", "consumption", "arrival"),
+            ("Latest production", "Latest consumption", "Latest arrivals"),
+        ):
+            if metric in latest_actuals.index:
+                row = latest_actuals.loc[metric]
+                column.metric(
+                    label,
+                    f"{row['actual_quantity_tonnes_month']:,.0f} t",
+                    help=f"Latest actual month: {pd.to_datetime(row['date']).strftime('%B %Y')}",
+                )
+        if latest_balance is not None:
+            shortfall = float(latest_balance["shortfall_p50_tonnes_month"])
+            metric_columns[3].metric(
+                "Forecast shortfall / surplus",
+                f"{shortfall:,.0f} t",
+                "Potential shortfall" if shortfall > 0 else "Potential surplus",
+                delta_color="inverse" if shortfall > 0 else "normal",
+                help=f"Forecast month: {pd.to_datetime(latest_balance['date']).strftime('%B %Y')}",
+            )
+
+        st.markdown("#### Monthly quantities")
+        st.caption("Circles show actuals · Diamonds show forecast medians · Shaded areas show P10–P90 forecast ranges")
         fig3 = go.Figure()
+        metric_styles = {
+            "production": {"label": "Production", "color": "#18846B", "fill": "rgba(24,132,107,0.13)"},
+            "consumption": {"label": "Consumption", "color": "#4469A8", "fill": "rgba(68,105,168,0.13)"},
+            "arrival": {"label": "Arrivals", "color": "#C78422", "fill": "rgba(199,132,34,0.16)"},
+        }
         for state in payload3.get("selected_states", []):
-            color = STATE_COLORS.get(state, "#4469a8")
             hist_state = qhist[qhist["state"] == state]
             pred_state = qpred[qpred["state"] == state]
-            for metric, label, dash in [
-                ("supply", "Supply", "solid"),
-                ("consumption", "Consumption", "dot"),
-                ("arrival", "Arrivals", "dash"),
-                ("production", "Production", "dashdot"),
-            ]:
-                h = hist_state[hist_state["metric"] == metric]
-                f = pred_state[pred_state["metric"] == metric]
+            for metric, style in metric_styles.items():
+                h = hist_state[hist_state["metric"] == metric].sort_values("date")
+                f = pred_state[pred_state["metric"] == metric].sort_values("date")
                 if not h.empty:
-                    fig3.add_trace(go.Scatter(x=h["date"], y=h["actual_quantity_mq_day"], mode="lines",
-                        name=f"{state} {label} · actual", line={"color": color, "width": 2 if metric == "supply" else 1.8, "dash": dash}, legendgroup=f"{state}-{metric}"))
+                    fig3.add_trace(go.Scatter(
+                        x=h["date"],
+                        y=h["actual_quantity_tonnes_month"],
+                        mode="lines+markers",
+                        name=f"{style['label']} · actual",
+                        line={"color": style["color"], "width": 2.3},
+                        marker={"color": style["color"], "size": 7, "symbol": "circle"},
+                        legendgroup=f"{state}-{metric}",
+                        hovertemplate="%{x|%b %Y}<br>Actual: %{y:,.0f} tonnes/month<extra></extra>",
+                    ))
                 if not f.empty:
-                    fig3.add_trace(go.Scatter(x=f["date"], y=f["predicted_quantity_mq_day"], mode="lines",
-                        name=f"{state} {label} · forecast P50", line={"color": color, "width": 2.5, "dash": "dash" if metric == "supply" else "dashdot"}, legendgroup=f"{state}-{metric}"))
+                    fig3.add_trace(go.Scatter(
+                        x=f["date"],
+                        y=f["p90_tonnes_month"],
+                        mode="lines",
+                        line={"color": style["color"], "width": 0},
+                        showlegend=False,
+                        hoverinfo="skip",
+                        legendgroup=f"{state}-{metric}",
+                    ))
+                    fig3.add_trace(go.Scatter(
+                        x=f["date"],
+                        y=f["p10_tonnes_month"],
+                        mode="lines",
+                        line={"color": style["color"], "width": 0},
+                        fill="tonexty",
+                        fillcolor=style["fill"],
+                        showlegend=False,
+                        hoverinfo="skip",
+                        legendgroup=f"{state}-{metric}",
+                    ))
+                    fig3.add_trace(go.Scatter(
+                        x=f["date"],
+                        y=f["predicted_quantity_tonnes_month"],
+                        mode="lines+markers",
+                        name=f"{style['label']} · forecast P50",
+                        line={"color": style["color"], "width": 2.6, "dash": "dash"},
+                        marker={"color": style["color"], "size": 9, "symbol": "diamond"},
+                        legendgroup=f"{state}-{metric}",
+                        hovertemplate="%{x|%b %Y}<br>Forecast P50: %{y:,.0f} tonnes/month<extra></extra>",
+                    ))
+                    if not h.empty:
+                        fig3.add_trace(go.Scatter(
+                            x=[pd.to_datetime(h["date"].iloc[-1]), pd.to_datetime(f["date"].iloc[0])],
+                            y=[
+                                h["actual_quantity_tonnes_month"].iloc[-1],
+                                f["predicted_quantity_tonnes_month"].iloc[0],
+                            ],
+                            mode="lines",
+                            line={"color": style["color"], "width": 2.6, "dash": "dash"},
+                            showlegend=False,
+                            hoverinfo="skip",
+                            legendgroup=f"{state}-{metric}",
+                        ))
         if payload3.get("forecast_start_date"):
-            fig3.add_vline(x=payload3["forecast_start_date"], line_dash="dot", line_color="#8d96a5", opacity=.75)
-        configure_chart(fig3, y_title="Metric quintals per day", height=470)
+            fig3.add_vline(
+                x=payload3["forecast_start_date"],
+                line_dash="dot",
+                line_color="#8d96a5",
+                opacity=.8,
+                annotation_text="Forecast starts",
+                annotation_position="top",
+                annotation_font_color="#697586",
+            )
+        configure_chart(fig3, y_title="Tonnes per month", height=470)
+        month_dates = pd.to_datetime(
+            pd.concat([qhist["date"], qpred["date"]], ignore_index=True)
+        ).drop_duplicates().sort_values()
+        fig3.update_xaxes(
+            tickmode="array",
+            tickvals=month_dates,
+            ticktext=[month.strftime("%b %Y") for month in month_dates],
+            tickangle=-35,
+            automargin=True,
+        )
+        fig3.update_yaxes(tickformat=",.0f")
+        fig3.update_layout(margin={"l": 12, "r": 18, "t": 42, "b": 105}, legend={"orientation": "h", "y": -0.3, "x": 0})
         st.plotly_chart(fig3, use_container_width=True)
-        st.caption("Shortfall = Supply − Consumption. Negative values mean potential shortfall; positive values mean potential surplus. Values are provisional until the quantity definitions and periods are confirmed.")
+        st.caption("Shortfall = Consumption − (Arrival + Production). Positive values indicate potential shortfall; negative values indicate potential surplus.")
     if not bpred.empty:
         latest = bpred[bpred["date"] == bpred["date"].max()]
         cards = st.columns(max(1, len(latest)))
         for col, (_, row) in zip(cards, latest.iterrows()):
-            val = float(row["shortfall_p50_metric_quintal_day"])
-            col.metric("Indicative shortfall / surplus · " + row["state"], f"{val:,.1f} mq/day", delta="Potential shortfall" if val < 0 else "Potential surplus", delta_color="inverse" if val < 0 else "normal")
+            val = float(row["shortfall_p50_tonnes_month"])
+            col.metric("Indicative shortfall / surplus · " + row["state"], f"{val:,.1f} tonnes/month", delta="Potential shortfall" if val > 0 else "Potential surplus", delta_color="inverse" if val > 0 else "normal")
         with st.expander("Supply, consumption and shortfall forecast rows"):
             st.dataframe(qpred, use_container_width=True, hide_index=True)
             st.dataframe(bpred, use_container_width=True, hide_index=True)
@@ -509,6 +614,8 @@ if payload3:
                 st.write(f"- {warning}")
     if not qpred.empty:
         st.download_button("Download supply / consumption forecast CSV", qpred.to_csv(index=False), file_name="supply_consumption_forecasts.csv", mime="text/csv", key="g3_download")
+    if not bpred.empty:
+        st.download_button("Download shortfall forecast CSV", bpred.to_csv(index=False), file_name="supply_demand_shortfall_forecast.csv", mime="text/csv", key="g3_balance_download")
 else:
     st.info("Select states, choose a horizon and click Update supply / demand outlook.")
 st.markdown('<hr class="section-rule"/>', unsafe_allow_html=True)

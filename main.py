@@ -1,9 +1,9 @@
 """Graph-specific Chronos-2 forecasting API for the onion forecasting MVP.
 
-Observation prices are stored in SQLite as INR per metric quintal. Chronos-2 sees
-those source units; only predicted price quantiles are converted to INR/kg before
-being returned and persisted in forecast_values. Quantity observations and forecasts
-are in metric quintals per day (subject to source-period validation).
+Daily observation prices are stored in SQLite as INR per metric quintal. Chronos-2
+sees those source units; only predicted price quantiles are converted to INR/kg before
+being returned and persisted in forecast_values. Graph 3 monthly observations and
+forecasts remain in tonnes per month.
 """
 from __future__ import annotations
 
@@ -24,9 +24,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from history_store import (
-    CSV_PATH, DB_PATH, PRICE_COLUMNS, QUANTITY_COLUMNS, SUPPLY_COLUMNS,
+    CSV_PATH, DB_PATH,
+    PRICE_COLUMNS, QUANTITY_COLUMNS,
     STATE_CODES, STATE_NAMES, get_latest_forecast, ingestion_status, list_forecast_runs,
-    load_history, save_forecast_run, sync_model_ready_csv,
+    load_ap_monthly_history, load_daily_price_history, save_forecast_run,
+    sync_model_ready_csv,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -113,11 +115,20 @@ async def authenticate_api_requests(request: Request, call_next):
 
 def get_data() -> pd.DataFrame:
     try:
-        return load_history()
+        return load_daily_price_history()
     except Exception as exc:
-        logger.exception("Could not load market history")
+        logger.exception("Could not load daily price history")
         raise HTTPException(
-            status_code=500, detail=f"Could not load market history: {exc}") from exc
+            status_code=500, detail=f"Could not load daily price history: {exc}") from exc
+
+
+def get_monthly_data() -> pd.DataFrame:
+    try:
+        return load_ap_monthly_history()
+    except Exception as exc:
+        logger.exception("Could not load monthly AP quantity history")
+        raise HTTPException(
+            status_code=500, detail=f"Could not load monthly AP quantity history: {exc}") from exc
 
 
 @lru_cache(maxsize=1)
@@ -150,13 +161,24 @@ def _date_range_horizon(data: pd.DataFrame, start_date: date, end_date: date) ->
             status_code=422, detail="start_date must be on or before end_date.")
 
     last_observation = pd.Timestamp(data["timestamp"].max()).date()
-    horizon_days = max(0, (end_date - last_observation).days)
-    if horizon_days > MAX_FORECAST_HORIZON_DAYS:
-        raise HTTPException(
-            status_code=422,
-            detail="forecasting cannot exceed 180 days",
-        )
-    return horizon_days
+    requested_horizon = max(0, (end_date - last_observation).days)
+    return min(requested_horizon, MAX_FORECAST_HORIZON_DAYS)
+
+
+def _forecast_limit_end_date(data: pd.DataFrame, requested_end_date: date) -> date:
+    last_observation = pd.Timestamp(data["timestamp"].max()).date()
+    latest_supported_date = last_observation + pd.Timedelta(days=MAX_FORECAST_HORIZON_DAYS)
+    return min(requested_end_date, latest_supported_date)
+
+
+def _forecast_limit_warning(requested_end_date: date, limit_end_date: date) -> str | None:
+    if requested_end_date <= limit_end_date:
+        return None
+    return (
+        f"Requested end_date {requested_end_date.isoformat()} is beyond the "
+        f"{MAX_FORECAST_HORIZON_DAYS}-day forecast limit. Forecasts are returned "
+        f"through {limit_end_date.isoformat()} (the maximum supported date)."
+    )
 
 
 def _actual_end_date(requested_end_date: date) -> date:
@@ -183,10 +205,10 @@ def _parse_list(raw: str, allowed: set[str], label: str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
-def _future_dates(data: pd.DataFrame, horizon: int) -> pd.DataFrame:
+def _future_dates(data: pd.DataFrame, horizon: int, freq: str = "D") -> pd.DataFrame:
     last_date = pd.Timestamp(data["timestamp"].max()).normalize()
-    dates = pd.date_range(last_date + pd.Timedelta(days=1),
-                          periods=horizon, freq="D")
+    next_date = last_date + (pd.offsets.MonthBegin(1) if freq == "MS" else pd.Timedelta(days=1))
+    dates = pd.date_range(next_date, periods=horizon, freq=freq)
     return pd.DataFrame({"item_id": [str(data["item_id"].iloc[0])] * horizon, "timestamp": dates})
 
 
@@ -200,12 +222,12 @@ _CACHE_LIMIT = 64
 
 def _run_target(data: pd.DataFrame, target: str, horizon: int,
                 context_covariates: list[str] | None = None,
-                future_covariates: pd.DataFrame | None = None) -> pd.DataFrame:
+                future_covariates: pd.DataFrame | None = None,
+                freq: str = "D") -> pd.DataFrame:
     """Run exactly one target with only its specified historical context columns.
 
-    Chronos-2's known future covariates are supplied via future_covariates. For retail
-    targets, wholesale and mandi modal future values are first forecast independently,
-    then passed as future covariates; no future actual values are leaked.
+    Chronos-2's known future covariates are supplied via future_covariates. Unknown
+    future price and arrival covariates are forecast independently before use.
     """
     _validate_horizon(horizon)
     context_covariates = list(context_covariates or [])
@@ -220,7 +242,7 @@ def _run_target(data: pd.DataFrame, target: str, horizon: int,
         ["item_id", "timestamp", *context_covariates, target]))
     context = data[selected_cols].copy()
     context["timestamp"] = pd.to_datetime(context["timestamp"])
-    future = _future_dates(data, horizon)
+    future = _future_dates(data, horizon, freq=freq)
     if future_covariates is not None and context_covariates:
         future_covariates = future_covariates.copy()
         future_covariates["timestamp"] = pd.to_datetime(
@@ -231,7 +253,7 @@ def _run_target(data: pd.DataFrame, target: str, horizon: int,
             raise HTTPException(
                 status_code=500, detail=f"Future covariate forecast missing values for target {target}.")
     key = "|".join([_frame_hash(context), _frame_hash(
-        future), target, str(horizon), MODEL_ID])
+        future), target, str(horizon), freq, MODEL_ID])
     if key in _PREDICTION_CACHE:
         return _PREDICTION_CACHE[key].copy(deep=True)
     try:
@@ -244,7 +266,7 @@ def _run_target(data: pd.DataFrame, target: str, horizon: int,
             target=target,
             prediction_length=horizon,
             quantile_levels=QUANTILES,
-            freq="D",
+            freq=freq,
         )
     except RuntimeError as exc:
         logger.exception("Chronos-2 unavailable")
@@ -265,8 +287,9 @@ def _run_target(data: pd.DataFrame, target: str, horizon: int,
     return result
 
 
-def _univariate_future(data: pd.DataFrame, col: str, horizon: int) -> pd.DataFrame:
-    result = _run_target(data, col, horizon)
+def _univariate_future(data: pd.DataFrame, col: str, horizon: int,
+                       freq: str = "D") -> pd.DataFrame:
+    result = _run_target(data, col, horizon, freq=freq)
     result = result.sort_values("timestamp")
     return pd.DataFrame({
         "timestamp": result["timestamp"].values,
@@ -276,20 +299,30 @@ def _univariate_future(data: pd.DataFrame, col: str, horizon: int) -> pd.DataFra
 
 def _price_target_forecast(data: pd.DataFrame, state: str, price_type: str, horizon: int) -> pd.DataFrame:
     target = PRICE_COLUMNS[state][price_type]
-    covariates: list[str] = []
+    covariates = _price_context_columns(state, price_type)[1:]
     future_covariates = None
-    if price_type == "retail":
-        # The retail target uses its own history plus same-state wholesale and mandi-modal history.
-        wholesale_col = PRICE_COLUMNS[state]["wholesale"]
-        mandi_col = PRICE_COLUMNS[state]["mandi_modal"]
-        covariates = [wholesale_col, mandi_col]
-        # Their future values are unknown: forecast each as a univariate series first.
-        wholesale_future = _univariate_future(data, wholesale_col, horizon)
-        mandi_future = _univariate_future(data, mandi_col, horizon)
-        future_covariates = wholesale_future.merge(
-            mandi_future, on="timestamp", validate="one_to_one")
-    # For wholesale and mandi modal targets, context is only Date + that target.
+    if covariates:
+        forecasts = [_univariate_future(data, col, horizon) for col in covariates]
+        future_covariates = forecasts[0]
+        for values in forecasts[1:]:
+            future_covariates = future_covariates.merge(
+                values, on="timestamp", validate="one_to_one")
     return _run_target(data, target, horizon, context_covariates=covariates, future_covariates=future_covariates)
+
+
+def _price_context_columns(state: str, price_type: str) -> list[str]:
+    inputs = {
+        "retail": ("wholesale", "mandi_modal", "arrival"),
+        "wholesale": ("mandi_modal", "arrival"),
+        "mandi_modal": ("arrival",),
+    }
+    target = PRICE_COLUMNS[state][price_type]
+    covariates = [
+        PRICE_COLUMNS[state][measure] if measure != "arrival"
+        else QUANTITY_COLUMNS[state]["arrival"]
+        for measure in inputs[price_type]
+    ]
+    return [target, *covariates]
 
 
 def _quantile_values(row: pd.Series) -> tuple[float, float, float]:
@@ -381,23 +414,28 @@ def _persist_prices(graph_code: str, data: pd.DataFrame, horizon: int, records: 
                               "context_columns": context_cols, "quantiles": QUANTILES})
 
 
-def _status(data: pd.DataFrame) -> dict:
+def _status(data: pd.DataFrame, frequency: str = "daily") -> dict:
     last_date = pd.Timestamp(data["timestamp"].max()).date()
     stale = (date.today() - last_date).days
     warnings = []
-    if stale > 1:
+    stale_limit = 45 if frequency == "monthly" else 1
+    if stale > stale_limit:
         warnings.append(
             f"Latest observation is {last_date.isoformat()} ({stale} day(s) behind the server date).")
     if stale < 0:
         warnings.append(
             "Latest observation date is in the future relative to the server date; verify timestamps.")
+    forecast_start = (
+        pd.Timestamp(last_date).to_period("M").to_timestamp() + pd.offsets.MonthBegin(1)
+        if frequency == "monthly" else last_date + pd.Timedelta(days=1)
+    )
     return {"last_observation_date": last_date.isoformat(), "data_staleness_days": stale,
-            "forecast_start_date": (last_date + pd.Timedelta(days=1)).isoformat(), "warnings": warnings}
+            "forecast_start_date": forecast_start.isoformat(), "warnings": warnings}
 
 
 def _metadata() -> dict:
     return {"model": MODEL_ID, "frequency": "daily", "observation_price_unit": "INR/metric quintal",
-            "forecast_price_unit": "INR/kg", "quantity_unit": "metric quintals/day (source period needs validation)",
+            "forecast_price_unit": "INR/kg", "quantity_unit": "metric quintals/day",
             "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
             "prediction_interval": {"nominal_coverage": 0.8, "description": "P10–P90 is a nominal central 80% prediction interval, not a guarantee."},
             "confidence_score": {"available": False, "reason": "Chronos-2 returns forecast quantiles, not a native calibrated scalar confidence score."}}
@@ -475,23 +513,19 @@ def ap_retail_graph(
     requested = _parse_list(price_types, set(PRICE_TYPES), "price types")
     selected = [PRICE_TYPES[x] for x in requested]
     actual_end_date = _actual_end_date(end_date)
-    forecast_display_start = _forecast_display_start_date(data, start_date, end_date)
+    forecast_limit_end = _forecast_limit_end_date(data, end_date)
+    forecast_display_start = _forecast_display_start_date(data, start_date, forecast_limit_end)
     horizon_days = _date_range_horizon(data, start_date, end_date)
     forecast: list[dict] = []
     context_cols: list[str] = []
     for price_type in selected:
-        target = PRICE_COLUMNS["AP"][price_type]
-        if price_type == "retail":
-            context_cols.extend(
-                [target, PRICE_COLUMNS["AP"]["wholesale"], PRICE_COLUMNS["AP"]["mandi_modal"]])
-        else:
-            context_cols.append(target)
+        context_cols.extend(_price_context_columns("AP", price_type))
         if horizon_days and forecast_display_start:
             result = _price_target_forecast(data, "AP", price_type, horizon_days)
             forecast.extend(_filter_date_records(
                 _price_forecast_records(data, "AP", price_type, result),
                 forecast_display_start,
-                end_date,
+                forecast_limit_end,
             ))
     historical = []
     for price_type in selected:
@@ -504,16 +538,22 @@ def ap_retail_graph(
         else None
     )
     status = _status(data)
+    forecast_warning = _forecast_limit_warning(end_date, forecast_limit_end)
+    if forecast_warning:
+        status["warnings"].append(forecast_warning)
     return {"graph": "ap_price_forecast", "title": "Andhra Pradesh Onion Price Forecast", "state": "AP",
             "state_name": STATE_NAMES["AP"], "price_types": selected, "unit": "INR/kg",
             "threshold_rs_kg": threshold_rs_kg, "horizon_days": horizon_days,
             "model_history_rows": int(len(data)), "visible_start_date": start_date.isoformat(),
             "visible_end_date": end_date.isoformat(),
             "requested_end_date": end_date.isoformat(),
+            "forecast_limit_date": forecast_limit_end.isoformat(),
+            "forecast_truncated": forecast_limit_end < end_date,
             "actual_end_date": actual_end_date.isoformat(),
-            "context_logic": {"retail": ["timestamp", PRICE_COLUMNS["AP"]["retail"], PRICE_COLUMNS["AP"]["wholesale"], PRICE_COLUMNS["AP"]["mandi_modal"]],
-                              "wholesale": ["timestamp", PRICE_COLUMNS["AP"]["wholesale"]],
-                              "mandi_modal": ["timestamp", PRICE_COLUMNS["AP"]["mandi_modal"]]},
+            "context_logic": {
+                price_type: ["timestamp", *_price_context_columns("AP", price_type)]
+                for price_type in ("retail", "wholesale", "mandi_modal")
+            },
             "historical": historical, "forecast": forecast, "metadata": _metadata(), "saved_to_sqlite": saved,
             **status,
             "forecast_start_date": forecast_display_start.isoformat() if forecast_display_start else None,
@@ -539,7 +579,8 @@ def state_comparison_graph(
     requested = _parse_list(price_types, set(PRICE_TYPES), "price types")
     selected_types = [PRICE_TYPES[x] for x in requested]
     actual_end_date = _actual_end_date(end_date)
-    forecast_display_start = _forecast_display_start_date(data, start_date, end_date)
+    forecast_limit_end = _forecast_limit_end_date(data, end_date)
+    forecast_display_start = _forecast_display_start_date(data, start_date, forecast_limit_end)
     horizon_days = _date_range_horizon(data, start_date, end_date)
 
     forecast: list[dict] = []
@@ -547,15 +588,7 @@ def state_comparison_graph(
     context_cols: list[str] = []
     for state in selected_states:
         for price_type in selected_types:
-            target = PRICE_COLUMNS[state][price_type]
-            if price_type == "retail":
-                context_cols.extend([
-                    target,
-                    PRICE_COLUMNS[state]["wholesale"],
-                    PRICE_COLUMNS[state]["mandi_modal"],
-                ])
-            else:
-                context_cols.append(target)
+            context_cols.extend(_price_context_columns(state, price_type))
 
             if horizon_days and forecast_display_start:
                 result = _price_target_forecast(
@@ -563,7 +596,7 @@ def state_comparison_graph(
                 forecast.extend(_filter_date_records(
                     _price_forecast_records(data, state, price_type, result),
                     forecast_display_start,
-                    end_date,
+                    forecast_limit_end,
                 ))
             historical.extend(
                 _history_price_records(
@@ -582,6 +615,9 @@ def state_comparison_graph(
         else None
     )
     status = _status(data)
+    forecast_warning = _forecast_limit_warning(end_date, forecast_limit_end)
+    if forecast_warning:
+        status["warnings"].append(forecast_warning)
     return {
         "graph": "state_price_comparison",
         "title": "Selected States — Onion Price Forecasts",
@@ -594,6 +630,8 @@ def state_comparison_graph(
         "visible_start_date": start_date.isoformat(),
         "visible_end_date": end_date.isoformat(),
         "requested_end_date": end_date.isoformat(),
+        "forecast_limit_date": forecast_limit_end.isoformat(),
+        "forecast_truncated": forecast_limit_end < end_date,
         "actual_end_date": actual_end_date.isoformat(),
         "historical": historical,
         "forecast": forecast,
@@ -611,105 +649,156 @@ def supply_balance_graph(
     start_date: date = Query(...,
                              description="First date to display, YYYY-MM-DD"),
     end_date: date = Query(...,
-                           description="Last date to display and forecast through, YYYY-MM-DD; more than 180 days after the latest observation returns an empty graph"),
+                           description="Last date to display and forecast through, YYYY-MM-DD; requests beyond 180 days return the maximum supported forecast"),
 ) -> dict:
-    """Graph 3: forecast supply=arrival+production and consumption as independent univariate targets."""
-    data = get_data()
+    """Graph 3: forecast AP monthly quantities and derive shortfall from their forecasts."""
+    data = get_monthly_data().rename(columns={"month_start": "timestamp"})
+    data["item_id"] = "AP_onion"
     selected_states = _parse_list(states, set(STATE_CODES), "states")
+    if selected_states != ["AP"]:
+        raise HTTPException(
+            status_code=422,
+            detail="The monthly supply-demand dataset currently contains Andhra Pradesh (AP) only.",
+        )
+    forecast_limit_end = _forecast_limit_end_date(data, end_date)
     horizon_days = _date_range_horizon(data, start_date, end_date)
+    latest_month = pd.Timestamp(data["timestamp"].max()).to_period("M")
+    limit_month = pd.Period(forecast_limit_end, freq="M")
+    horizon_months = max(0, limit_month.ordinal - latest_month.ordinal)
     forecast_rows: list[dict] = []
     historical: list[dict] = []
-    indexed: dict[tuple[str, str], dict[str, dict]] = {}
+    indexed: dict[str, dict[str, dict]] = {}
     db_values: list[dict] = []
     timestamps = pd.to_datetime(data["timestamp"]).dt.date
     history_mask = (timestamps >= start_date) & (timestamps <= end_date)
-    for state in selected_states:
-        supply_col = SUPPLY_COLUMNS[state]
-        consumption_col = QUANTITY_COLUMNS[state]["consumption"]
-        arrival_col = QUANTITY_COLUMNS[state]["arrival"]
-        production_col = QUANTITY_COLUMNS[state]["production"]
-        # Explicit requested logic: supply = arrival + production; target uses only Date + Supply.
-        supply_result = _run_target(data, supply_col, horizon_days)
-        consumption_result = _run_target(data, consumption_col, horizon_days)
-        arrival_result = _run_target(data, arrival_col, horizon_days)
-        production_result = _run_target(data, production_col, horizon_days)
-        for metric, result in (("supply", supply_result),
-    ("consumption", consumption_result),
-    ("arrival", arrival_result),
-    ("production", production_result)):
+    target_columns = {
+        "production": "production_t_month",
+        "consumption": "consumption_t_month",
+        "arrival": "arrival_t_month",
+    }
+    if horizon_months and start_date <= forecast_limit_end:
+        for metric, column in target_columns.items():
+            result = _run_target(data, column, horizon_months, freq="MS")
             for _, row in result.sort_values("timestamp").iterrows():
-                q10, q50, q90 = _quantile_values(row)
-                day = pd.Timestamp(row["timestamp"]).date().isoformat()
-                if not start_date.isoformat() <= day <= end_date.isoformat():
+                month = pd.Timestamp(row["timestamp"]).date().isoformat()
+                if not start_date.isoformat() <= month <= forecast_limit_end.isoformat():
                     continue
-                item = {"date": day, "state": state, "state_name": STATE_NAMES[state], "metric": metric,
-                        "predicted_quantity_mq_day": round(q50, 4), "p10_mq_day": round(q10, 4),
-                        "p50_mq_day": round(q50, 4), "p90_mq_day": round(q90, 4),
-                        "unit": "metric_quintal/day"}
+                q10, q50, q90 = _quantile_values(row)
+                item = {
+                    "date": month,
+                    "state": "AP",
+                    "state_name": STATE_NAMES["AP"],
+                    "metric": metric,
+                    "predicted_quantity_tonnes_month": round(q50, 4),
+                    "p10_tonnes_month": round(q10, 4),
+                    "p50_tonnes_month": round(q50, 4),
+                    "p90_tonnes_month": round(q90, 4),
+                    "predicted_quantity_mq_day": round(q50, 4),
+                    "p10_mq_day": round(q10, 4),
+                    "p50_mq_day": round(q50, 4),
+                    "p90_mq_day": round(q90, 4),
+                    "unit": "tonnes/month",
+                }
                 forecast_rows.append(item)
-                indexed.setdefault((state, day), {})[metric] = item
-        # Historical data returns supply and consumption only as target-series context; arrival/production
-        # components remain in SQLite and are combined into supply on read.
-        for metric, col in (("supply", supply_col),
-    ("consumption", consumption_col),
-    ("arrival", arrival_col),
-    ("production", production_col),):
-            for row in data.loc[history_mask, ["timestamp", col]].itertuples(index=False):
-                historical.append({"date": row.timestamp.date().isoformat(), "state": state, "state_name": STATE_NAMES[state],
-                                   "metric": metric, "actual_quantity_mq_day": round(float(getattr(row, col)), 4),
-                                   "unit": "metric_quintal/day"})
+                indexed.setdefault(month, {})[metric] = item
+
+    for metric, column in target_columns.items():
+        for row in data.loc[history_mask, ["timestamp", column]].itertuples(index=False):
+            quantity = round(float(getattr(row, column)), 4)
+            historical.append({
+                "date": row.timestamp.date().isoformat(),
+                "state": "AP",
+                "state_name": STATE_NAMES["AP"],
+                "metric": metric,
+                "actual_quantity_tonnes_month": quantity,
+                "actual_quantity_mq_day": quantity,
+                "unit": "tonnes/month",
+            })
+
     balance = []
-    for (state, day), vals in sorted(indexed.items()):
-        if "supply" not in vals or "consumption" not in vals:
+    for month, vals in sorted(indexed.items()):
+        if not {"production", "consumption", "arrival"}.issubset(vals):
             continue
-        supply, cons = vals["supply"], vals["consumption"]
-        # Conservative component bounds; these are not a calibrated joint interval.
-        p10 = supply["p10_mq_day"] - cons["p90_mq_day"]
-        p50 = supply["predicted_quantity_mq_day"] - \
-            cons["predicted_quantity_mq_day"]
-        p90 = supply["p90_mq_day"] - cons["p10_mq_day"]
-        balance.append({"date": day, "state": state, "state_name": STATE_NAMES[state],
-                        "shortfall_p10_metric_quintal_day": round(p10, 4),
-                        "shortfall_p50_metric_quintal_day": round(p50, 4),
-                        "shortfall_p90_metric_quintal_day": round(p90, 4),
-                        "classification": "potential_surplus" if p50 > 0 else ("potential_shortfall" if p50 < 0 else "near_balance")})
+        production, consumption, arrival = (
+            vals["production"], vals["consumption"], vals["arrival"])
+        p10 = (consumption["p10_tonnes_month"] - arrival["p90_tonnes_month"]
+               - production["p90_tonnes_month"])
+        p50 = (consumption["predicted_quantity_tonnes_month"]
+               - arrival["predicted_quantity_tonnes_month"]
+               - production["predicted_quantity_tonnes_month"])
+        p90 = (consumption["p90_tonnes_month"] - arrival["p10_tonnes_month"]
+               - production["p10_tonnes_month"])
+        balance.append({
+            "date": month,
+            "state": "AP",
+            "state_name": STATE_NAMES["AP"],
+            "shortfall_p10_tonnes_month": round(p10, 4),
+            "shortfall_p50_tonnes_month": round(p50, 4),
+            "shortfall_p90_tonnes_month": round(p90, 4),
+            "shortfall_p10_metric_quintal_day": round(p10, 4),
+            "shortfall_p50_metric_quintal_day": round(p50, 4),
+            "shortfall_p90_metric_quintal_day": round(p90, 4),
+            "classification": "potential_shortfall" if p50 > 0 else (
+                "potential_surplus" if p50 < 0 else "near_balance"),
+        })
+
     for row in forecast_rows:
-        db_values.append({"state_code": row["state"], "target_key": row["metric"], "forecast_date": row["date"],
-                          "p10": row["p10_mq_day"], "p50": row["predicted_quantity_mq_day"],
-                          "p90": row["p90_mq_day"], "unit": "metric_quintal/day"})
+        db_values.append({
+            "state_code": row["state"], "target_key": row["metric"],
+            "forecast_date": row["date"], "p10": row["p10_tonnes_month"],
+            "p50": row["predicted_quantity_tonnes_month"],
+            "p90": row["p90_tonnes_month"], "unit": "tonnes/month",
+        })
     for row in balance:
-        db_values.append({"state_code": row["state"], "target_key": "shortfall", "forecast_date": row["date"],
-                          "p10": row["shortfall_p10_metric_quintal_day"], "p50": row["shortfall_p50_metric_quintal_day"],
-                          "p90": row["shortfall_p90_metric_quintal_day"], "unit": "metric_quintal/day"})
-    context_cols = []
-    for state in selected_states:
-        context_cols.extend(
-            [SUPPLY_COLUMNS[state],
-    QUANTITY_COLUMNS[state]["consumption"],
-    QUANTITY_COLUMNS[state]["arrival"],
-    QUANTITY_COLUMNS[state]["production"],])
-    saved = save_forecast_run("graph3_supply_balance", horizon_days,
-                              pd.Timestamp(
-                                  data["timestamp"].max()).date().isoformat(),
-                              _context_signature(
-                                  data, context_cols), db_values, MODEL_ID,
-                              {"context_logic": {s: {"supply": ["timestamp", SUPPLY_COLUMNS[s]],
-                                                     "consumption": ["timestamp", QUANTITY_COLUMNS[s]["consumption"]], "arrival": ["timestamp", QUANTITY_COLUMNS[s]["arrival"]],
-"production": ["timestamp", QUANTITY_COLUMNS[s]["production"]],}
-                                                 for s in selected_states},
-                               "balance_formula": "supply - consumption", "unit": "metric_quintal/day"})
+        db_values.append({
+            "state_code": row["state"], "target_key": "shortfall",
+            "forecast_date": row["date"], "p10": row["shortfall_p10_tonnes_month"],
+            "p50": row["shortfall_p50_tonnes_month"],
+            "p90": row["shortfall_p90_tonnes_month"], "unit": "tonnes/month",
+        })
+    context_cols = list(target_columns.values())
+    saved = (
+        save_forecast_run(
+            "graph3_supply_balance", horizon_days,
+            pd.Timestamp(data["timestamp"].max()).date().isoformat(),
+            _context_signature(data, context_cols), db_values, MODEL_ID,
+            {
+                "context_logic": {
+                    metric: ["month_start", column]
+                    for metric, column in target_columns.items()
+                },
+                "balance_formula": "consumption - (arrival + production)",
+                "unit": "tonnes/month",
+                "forecast_frequency": "monthly",
+            },
+        )
+        if balance else None
+    )
     warnings = [
-        "Supply is calculated as arrivals + production as requested; confirm that arrivals and production are compatible flows and do not double-count the same supply.",
-        "The source production/consumption series repeat across many daily rows; verify their real reporting frequency before interpreting daily forecasts.",
-        "Shortfall is supply minus consumption: negative values indicate demand exceeds supply; positive values indicate surplus.",
+        "Shortfall = Consumption - (Arrival + Production). Positive values indicate potential shortfall; negative values indicate potential surplus.",
         "Shortfall P10/P90 combine component quantiles conservatively and are not a calibrated joint prediction interval.",
     ]
-    return {"graph": "supply_demand_shortfall", "title": "Onion Supply, Consumption and Shortfall Forecast",
+    forecast_warning = _forecast_limit_warning(end_date, forecast_limit_end)
+    if forecast_warning:
+        warnings.append(forecast_warning)
+    status = _status(data, frequency="monthly")
+    first_forecast_date = min((row["date"] for row in forecast_rows), default=None)
+    status["forecast_start_date"] = first_forecast_date
+    status["warnings"] = warnings + status["warnings"]
+    metadata = {
+        **_metadata(),
+        "frequency": "monthly",
+        "quantity_unit": "tonnes/month",
+    }
+    return {"graph": "supply_demand_shortfall", "title": "Andhra Pradesh Monthly Supply-Demand Balance Forecast",
             "selected_states": selected_states, "selected_state_names": [STATE_NAMES[x] for x in selected_states],
-            "horizon_days": horizon_days, "quantity_unit": "metric_quintal/day", "historical": historical,
+            "horizon_days": horizon_days, "quantity_unit": "tonnes/month", "historical": historical,
             "quantity_forecast": forecast_rows, "balance_forecast": balance,
-            "balance_formula": "supply - consumption", "warnings": warnings, "metadata": _metadata(),
-            "saved_to_sqlite": saved, **_status(data),
+            "balance_formula": "consumption - (arrival + production)", "warnings": warnings, "metadata": metadata,
+            "requested_end_date": end_date.isoformat(),
+            "forecast_limit_date": forecast_limit_end.isoformat(),
+            "forecast_truncated": forecast_limit_end < end_date,
+            "saved_to_sqlite": saved, **status,
             "forecast_end_date": max((r["date"] for r in forecast_rows), default=None)}
 
 

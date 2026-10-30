@@ -1,23 +1,23 @@
 # Onion Forecasting MVP — Chronos-2 + FastAPI + Streamlit
 
-This project is a local, runnable MVP built around the supplied combined CSV for Andhra Pradesh (AP), Karnataka (KA), Maharashtra (MH), and Madhya Pradesh (MP).
+This project is a local, runnable MVP using separate daily price and AP monthly quantity datasets. Graph-specific observations are synchronized into SQLite before forecasting.
 
 ## What is included
 
-- **Graph 1 API/UI:** AP retail and/or mandi modal-price forecast for 7, 14, 30, 60, or 90 days, with P50 and P10–P90 prediction bounds. The model uses all available history; only the last 90 actual days are returned for the graph.
-- **Graph 2 API/UI:** Select any subset of states and compare retail and wholesale/mandi-modal prices. Only selected states and price types are returned, while all state histories remain available as model covariates. Supports 7, 14, 30, 60, or 90 days.
-- **Graph 3 API/UI:** Chronos-2 forecasts arrivals, production, and consumption; calculates the explicitly provisional `arrival + production - consumption` balance proxy. Supports 7, 14, 30, 60, or 90 days.
-- **SQLite history store:** Seeds itself from the model-ready CSV on first start. Subsequent full model-ready CSV imports use timestamp-based upserts (insert new dates, update corrected dates, skip unchanged rows).
+- **Graph 1 API/UI:** Forecasts AP retail, wholesale, and mandi modal prices using the specified AP price and arrival history.
+- **Graph 2 API/UI:** Forecasts retail, wholesale, and mandi modal prices independently for AP, MH, KA, and MP using only each selected state's matching price and arrival history.
+- **Graph 3 API/UI:** Forecasts AP monthly production, consumption, and arrivals in tonnes/month, then derives shortfall as `consumption - (arrival + production)`.
+- **SQLite history store:** Automatically synchronizes the configured daily price CSV and monthly AP CSV into separate graph-specific SQLite tables. Source changes are reloaded on the next graph request. The existing full-schema ingestion store remains available for its existing ingestion workflows.
 - **UPAg discovery utility:** Uses credentials from local `.env`, logs into the official UPAg Open API, lists the source names permitted for that account, and can save raw JSON responses when a source-specific request payload is provided.
 - **Mocked API tests:** Check request/response structure without downloading Chronos-2 model weights.
 
 ## Important honesty/limitations
 
 1. The actual Chronos-2 model has to be installed and its weights downloaded on your machine. The mocked tests do **not** claim real inference was executed here.
-2. The supplied model-ready CSV ends on **2026-10-15**. Forecasts start on **2026-10-16**, the day after the last observation. The API shows a freshness warning because that history is not current as of 2026-10-27.
+2. The configured daily price CSV ends on **2026-10-25**; the monthly AP CSV ends in **October 2026**. Forecast results use the source's daily or monthly frequency.
 3. The supplied CSV does not contain weather. This MVP does not yet claim to forecast under El Niño/cyclone scenarios.
-4. The production and consumption fields repeat for long daily runs. Validate their real reporting frequency and units before interpreting daily forecasts.
-5. The Graph 3 balance calculation is provisional. If arrivals form part of the same production flow, `arrival + production - consumption` may double-count supply. Its bounds are a conservative combination of individual quantiles, not a calibrated joint interval.
+4. Graph 3 quantities are monthly totals supplied by the BA team. Validate the definitions of production, consumption, and arrivals before interpreting the resulting shortfall.
+5. Shortfall quantile bounds are conservative combinations of individual component quantiles, not a calibrated joint interval.
 6. UPAg credentials alone do not prove that a source provides the fields required by the model. First list the sources authorized to the account and inspect the exact response schema. The included UPAg utility fetches **raw data only**; it does not silently map unknown source columns into the model-ready dataset.
 
 ## Recommended environment
@@ -79,7 +79,9 @@ GET http://127.0.0.1:8000/api/ingestion/status
 
 ## History store and CSV updates
 
-The first API start seeds `data/onion_history.sqlite3` from `data/Onion_Model_Ready_Dataset_Chronos2.csv`. The database is the live read path after seeding. The SQLite file is ignored by Git and is created locally.
+The existing full-schema ingestion store is initialized from its configured legacy CSV when required. Graph requests separately synchronize the new daily and monthly datasets into graph-specific tables in the configured SQLite database (default: `data/onion_forecasting_v4.sqlite3`). The SQLite file is ignored by Git and is created locally.
+
+Graphs 1 and 2 instead read the daily dataset configured by `ONION_DAILY_PRICE_DATA_PATH`; Graph 3 reads the monthly AP dataset configured by `ONION_AP_MONTHLY_DATA_PATH`. The supplied defaults point to the two CSV paths provided for this change. Set these variables in `.env` if the files are stored elsewhere. The API validates each dataset and synchronizes it into `daily_price_observations` or `ap_monthly_observations` in the same SQLite database. These graph endpoints do not use the legacy combined model-ready CSV as their observation source.
 
 If you receive a newer **full combined model-ready** CSV, put it inside `data/` and import it:
 
@@ -127,8 +129,8 @@ Before turning polling on, the next implementation step is a source adapter that
 
 1. Requests **yesterday's date** (Asia/Kolkata) from the public UPAg Dash MIP by-crop endpoint for all four states (AP, MH, KA, MP).
 2. Extracts the four sourced series per state — **retail, wholesale and mandi modal prices (Rs/Qtl, unconverted)** and **mandi arrivals (Tonnes ×10 → metric quintals)**.
-3. Appends dates that are missing, corrects single values that the source revised (logged in `data/corrections_log.csv`), and skips identical values — so the four runs per day are idempotent.
-4. Forward-fills the two series this source does not provide (**production, consumption**) on new dates from the previous row, matching how the "Interpolated" dataset was built. If the DB lags behind yesterday, the window auto-extends back to `DB_last + 1` and unfilled dates become `upag_dash_6h_gapfill` rows so the daily index never breaks.
+3. Appends dates that are missing, corrects single values that the source revised (logged in `data/corrections_log.csv`), and skips identical values — so the four runs per day are idempotent. Values are written to the legacy ingestion history and mirrored into `daily_price_observations` for the graph API.
+4. Forward-fills fields not supplied by this API on new daily rows, matching how the "Interpolated" dataset was built. AP daily arrivals are also rolled up from quintals/day to tonnes/month in the matching `ap_monthly_observations` row; monthly production and consumption remain sourced from the configured monthly dataset. If the DB lags behind yesterday, the window auto-extends back to `DB_last + 1` and unfilled dates become `upag_dash_6h_gapfill` rows so the daily index never breaks.
 
 Mapping provenance: every series was cross-checked against the ingested history on 2026-10-28 with anchor dates for all four states (e.g. AP 2022-01-01 retail 4000.0, MP 2023-06-18 wholesale 1205.45, MP arrivals 1219.35 T → 12193.5 qtl). A mismatch raises loudly and blocks ingestion (`dash_extract.ANCHORS`).
 
@@ -154,7 +156,7 @@ install above remains the default and is independent of the backend.
 
 Every run is auditable in `ingestion_log`, and raw responses are snapshotted under `data/snapshots/` (newest 30 kept). Environment switches live in `.env` (`UPAG_DASH_ENABLED`, `UPAG_DASH_DAYS`, `UPAG_DASH_SNAPSHOTS`, `UPAG_DASH_UPDATE_EXISTING`, …). Lock file `data/pull_upag_dash.lock` prevents overlapping runs. Offline tests: `pytest tests\test_dash_ingestion.py`.
 
-The scheduled job fetches UPAg Dash data and writes it directly to SQLite; it does not call the local FastAPI HTTP API. The API reads the updated database when its data endpoints are requested.
+The scheduled job fetches UPAg Dash data and writes it directly to SQLite; it does not call the local FastAPI HTTP API. The API reads the updated database when its data endpoints are requested. If an AP monthly row is not yet present, the job reports that its arrival total could not be updated; it does not invent monthly production or consumption values.
 
 ## Chronos-2 output interpretation
 
@@ -174,6 +176,6 @@ These tests monkeypatch Chronos-2 to verify the three API response shapes. To co
 
 ## v4 graph-specific model logic and persisted forecasts
 
-The default dataset is now the cleaned 1,760-row file through 2026-10-26, with prices in INR per metric quintal and quantities in metric quintals. The database preserves those observation units. Forecast price outputs alone are converted to INR/kg before being returned and saved in SQLite.
+The daily graph dataset contains 1,759 rows through 2026-10-25; its prices are converted from INR/kg to INR per metric quintal for model context, while forecast outputs are converted back to INR/kg. Daily arrivals are converted from tonnes/day to metric quintals/day. The monthly AP dataset contains 58 months through October 2026 and retains its tonnes/month units.
 
-Each graph uses explicit target/context columns: Graph 1 AP retail uses AP retail + AP wholesale + AP mandi modal history (with future covariates forecast first); AP wholesale and AP mandi modal are univariate targets. Graph 2 applies that rule to each selected state. Graph 3 forecasts derived Supply = arrivals + production and Consumption separately, then calculates Shortfall = Supply - Consumption. Every successful graph forecast is persisted to `forecast_runs` and `forecast_values`. See `IMPLEMENTATION_NOTES.md` and `FRONTEND_INTEGRATION.md`.
+Each price forecast includes its own historical target context. Retail inputs are same-state wholesale, mandi modal, and arrivals; wholesale inputs are same-state mandi modal and arrivals; mandi modal inputs are same-state arrivals. Unknown future covariates are independently forecast first. Graph 3 forecasts monthly production, consumption, and arrivals as separate univariate targets and derives `Shortfall = Consumption - (Arrival + Production)`. The model's 180-day maximum is preserved; longer requested ranges return forecasts up to the maximum supported date and flag the truncated range in the response. Forecasts are persisted to `forecast_runs` and `forecast_values`. See `IMPLEMENTATION_NOTES.md` and `FRONTEND_INTEGRATION.md`.

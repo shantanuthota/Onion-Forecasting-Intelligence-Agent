@@ -1,35 +1,34 @@
 # Graph-specific forecasting and SQLite persistence
 
-## Canonical observation data
+## Graph observation datasets
 
-The default input is `data/Onion_Model_Ready_Dataset_Chronos2_2026-10-26_Interpolated_Metric_Quintal.csv` (1,760 daily rows, 2022-01-01 through 2026-10-26).
+Graphs 1 and 2 use the configured daily price CSV (1,759 rows, 2022-01-01 through 2026-10-25). Its prices are normalized to INR per metric quintal and arrivals to metric quintals/day before being synchronized into `daily_price_observations`. Graph 3 uses the configured AP monthly CSV (58 rows, January 2022 through October 2026), synchronized into `ap_monthly_observations` in tonnes/month. Both sources refresh their SQLite table when the configured CSV changes.
 
-SQLite observations keep prices in INR per metric quintal and quantities in metric quintals. The latest cleaned dataset is imported automatically into SQLite at first start and re-imported when its configured CSV changes. Forecast price values alone are persisted in the forecast table in INR/kg. Historical API values are converted only in the response layer to keep chart lines in comparable INR/kg units; observation values in SQLite remain unchanged.
+Forecast price values are persisted in INR/kg. Historical prices are converted in the response layer so chart lines remain comparable with forecasts.
 
 ## Explicit target/context rules
 
 ### Graph 1 — Andhra Pradesh
 
-- AP retail target: `AP_retail_rs_per_metric_quintal`; historical context is timestamp + AP retail + AP wholesale + AP mandi modal. Because future wholesale and mandi values are not known, Chronos-2 first forecasts each of those two series univariately and passes those forecast medians as future covariates to the AP retail target forecast.
-- AP wholesale target: timestamp + AP wholesale only.
-- AP mandi modal target: timestamp + AP mandi modal only.
+- AP retail target: `AP_retail_rs_per_metric_quintal`; context is timestamp + AP retail + AP wholesale + AP mandi modal + AP arrivals. Unknown future covariates are independently forecast first.
+- AP wholesale target: timestamp + AP wholesale + AP mandi modal + AP arrivals. Unknown future covariates are independently forecast first.
+- AP mandi modal target: timestamp + AP mandi modal + AP arrivals. Unknown future arrivals are independently forecast first.
 - The UI/API can request any subset using `price_types=retail,wholesale,mandi_modal`.
 
 ### Graph 2 — selected states
 
-Same logic as Graph 1, applied independently for each selected state. Only selected states/price types are returned and persisted for that graph run.
+The same input hierarchy is applied independently for each selected state: retail uses same-state wholesale, mandi modal, and arrivals; wholesale uses same-state mandi modal and arrivals; mandi modal uses same-state arrivals. Each target also uses its own historical target series. Only selected states/price types are returned and persisted for that graph run.
 
-### Graph 3 — supply / consumption / shortfall
+### Graph 3 — AP monthly production / consumption / arrivals / shortfall
 
-- Historical supply is derived as `arrival + production` for each state.
-- Supply target context: timestamp + derived supply only.
-- Consumption target context: timestamp + consumption only.
-- `shortfall = supply - consumption`; negative values mean potential shortfall, positive values mean potential surplus.
-- Shortfall is derived from the supply and consumption forecasts and stored alongside them. It is not a separate Chronos target.
+- Production, consumption, and arrivals are loaded from the AP monthly CSV in tonnes/month.
+- Each component is forecast as a separate monthly target, with only its own historical series and month timestamps as context.
+- `shortfall = consumption - (arrival + production)`; positive values mean potential shortfall, negative values mean potential surplus.
+- Shortfall is derived from the three component forecasts and stored alongside them. It is not a separate Chronos target.
 
 ## Forecast persistence
 
-Every successful graph endpoint call creates a row in `forecast_runs` and saves its forecast quantiles in `forecast_values`. Each saved value has graph run, state, target, forecast date, P10/P50/P90 and unit. Price forecast values are stored in INR/kg; quantity and shortfall values are stored in metric quintals/day. Inspect them with:
+Every successful graph endpoint call creates a row in `forecast_runs` and saves its forecast quantiles in `forecast_values`. Each saved value has graph run, state, target, forecast date, P10/P50/P90 and unit. Price forecast values are stored in INR/kg; Graph 3 quantities and shortfall are stored in tonnes/month. Inspect them with:
 
 - `GET /api/forecasts/latest?graph_code=graph1_ap_prices`
 - `GET /api/forecasts/runs`
@@ -37,9 +36,9 @@ Every successful graph endpoint call creates a row in `forecast_runs` and saves 
 ## Important modelling caveats
 
 - The Chronos-2 inference path is implemented using the selected context columns. Real Chronos-2 inference still needs to be run in the user's local environment with the model dependencies and weights installed.
-- The retail model needs future covariate values; this implementation forecasts future wholesale and mandi modal prices first instead of leaking unknown actual future values.
-- Supply = arrivals + production and shortfall = supply − consumption follow the requested business logic. Confirm compatible units/time periods and whether arrivals overlap production before treating the result as a true state-level surplus/shortfall.
-- Production and consumption may be repeated periodic estimates rather than genuine daily observations; daily forecasts should be evaluated before operational use.
+- Price models need future covariate values; this implementation forecasts the same-state inputs first instead of leaking unknown actual future values.
+- Graph 3 uses monthly source data and the requested shortfall formula. Validate the definitions of the monthly measures before operational use.
+- Requests beyond 180 days return the maximum supported forecast range, with `forecast_truncated`, `forecast_limit_date`, and a warning describing the cap.
 - P10/P50/P90 are quantiles, not a scalar confidence score.
 
 ## Automated UPAg Dash ingestion (scheduled)

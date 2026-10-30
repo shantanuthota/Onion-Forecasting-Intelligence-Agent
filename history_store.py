@@ -1,10 +1,13 @@
-"""SQLite history and forecast persistence for the onion Chronos-2 MVP.
+"""SQLite dataset and forecast persistence for the onion Chronos-2 MVP.
 
-Canonical observation units in SQLite:
+The legacy daily observation store uses:
 - prices: INR per metric quintal (₹/metric quintal)
 - arrivals: metric quintals per observation/day
 - production and consumption: metric quintals/day
-Forecast prices are persisted separately in INR/kg, as requested.
+
+Graph-specific tables store daily price/arrival observations in model units and AP
+monthly production, consumption, and arrivals in tonnes/month. Forecast prices are
+persisted separately in INR/kg.
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ import math
 import os
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,6 +27,12 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 DEFAULT_CSV = ROOT / "data" / "Onion_Model_Ready_Dataset_Chronos2_2026-10-26_Interpolated_Metric_Quintal.csv"
+DEFAULT_DAILY_PRICE_CSV = Path(
+    r"C:\Users\shant\Downloads\Onion_Daily_Price_Forecasting_Dataset_2022-01-01_to_2026-10-25.csv"
+)
+DEFAULT_AP_MONTHLY_CSV = Path(
+    r"C:\Users\shant\Downloads\Onion_AP_Monthly_Dataset_2022-01_to_2026-10.csv"
+)
 STATE_CODES = ("AP", "KA", "MH", "MP")
 STATE_NAMES = {"AP": "Andhra Pradesh", "KA": "Karnataka", "MH": "Maharashtra", "MP": "Madhya Pradesh"}
 
@@ -57,7 +66,18 @@ def _resolve_path(env_name: str, fallback: Path) -> Path:
     return p if p.is_absolute() else (ROOT / p).resolve()
 
 CSV_PATH = _resolve_path("ONION_DATA_PATH", DEFAULT_CSV)
+DAILY_PRICE_CSV_PATH = _resolve_path("ONION_DAILY_PRICE_DATA_PATH", DEFAULT_DAILY_PRICE_CSV)
+AP_MONTHLY_CSV_PATH = _resolve_path("ONION_AP_MONTHLY_DATA_PATH", DEFAULT_AP_MONTHLY_CSV)
 DB_PATH = _resolve_path("ONION_DB_PATH", ROOT / "data" / "onion_forecasting_v4.sqlite3")
+
+DAILY_GRAPH_COLUMNS = [
+    "item_id", "timestamp",
+    *(PRICE_COLUMNS[state][measure] for state in STATE_CODES for measure in ("retail", "wholesale", "mandi_modal")),
+    *(QUANTITY_COLUMNS[state]["arrival"] for state in STATE_CODES),
+]
+MONTHLY_GRAPH_COLUMNS = [
+    "month_start", "production_t_month", "consumption_t_month", "arrival_t_month",
+]
 
 
 @dataclass
@@ -118,6 +138,18 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         unit TEXT NOT NULL, PRIMARY KEY (run_id,state_code,target_key,forecast_date),
         FOREIGN KEY (run_id) REFERENCES forecast_runs(run_id) ON DELETE CASCADE)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_forecast_values_latest ON forecast_values(state_code,target_key,forecast_date)")
+    daily_value_columns = ", ".join(
+        f'"{column}" REAL NOT NULL' for column in DAILY_GRAPH_COLUMNS[2:])
+    conn.execute(
+        f'CREATE TABLE IF NOT EXISTS daily_price_observations ('
+        f'"timestamp" TEXT PRIMARY KEY, "item_id" TEXT NOT NULL, {daily_value_columns})'
+    )
+    conn.execute("""CREATE TABLE IF NOT EXISTS ap_monthly_observations (
+        month_start TEXT PRIMARY KEY, production_t_month REAL NOT NULL,
+        consumption_t_month REAL NOT NULL, arrival_t_month REAL NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS graph_dataset_sync_state (
+        dataset_key TEXT PRIMARY KEY, source_path TEXT NOT NULL, source_mtime_ns INTEGER NOT NULL,
+        source_size INTEGER NOT NULL, synced_at TEXT NOT NULL)""")
 
 
 def _canonicalize_source_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -140,7 +172,8 @@ def _canonicalize_source_columns(frame: pd.DataFrame) -> pd.DataFrame:
                     break
         # Quantity alternatives.
         quantity_alts = {
-            "arrival": [QUANTITY_COLUMNS[state]["arrival"], f"{state}_arrival_mq", f"{state}_arrival_t"],
+            "arrival": [QUANTITY_COLUMNS[state]["arrival"], f"{state}_arrival_mq", f"{state}_arrival_t",
+                        f"{state}_arrival_t_day"],
             "production": [QUANTITY_COLUMNS[state]["production"], f"{state}_production_mq_day", f"{state}_production_t_day"],
             "consumption": [QUANTITY_COLUMNS[state]["consumption"], f"{state}_consumption_mq_day", f"{state}_consumption_t_day"],
         }
@@ -151,6 +184,187 @@ def _canonicalize_source_columns(frame: pd.DataFrame) -> pd.DataFrame:
                     break
     src = src.rename(columns=rename)
     return src
+
+
+def _validate_graph_frame(out: pd.DataFrame, date_column: str, frequency: str) -> pd.DataFrame:
+    if out.empty:
+        raise ValueError("Dataset must contain at least one observation.")
+    if out[date_column].isna().any():
+        raise ValueError(f"Dataset contains invalid or blank {date_column} values.")
+    if out[date_column].duplicated().any():
+        raise ValueError(f"Dataset contains duplicate {date_column} values.")
+    for column in out.columns:
+        if column in (date_column, "item_id"):
+            continue
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+    numeric = [column for column in out.columns if column not in (date_column, "item_id")]
+    bad = [column for column in numeric if out[column].isna().any()
+           or not np.isfinite(out[column].to_numpy(dtype=float)).all()]
+    if bad:
+        raise ValueError("Dataset has missing/non-numeric/non-finite values in: " + ", ".join(bad))
+    out = out.sort_values(date_column).reset_index(drop=True)
+    if frequency == "D":
+        expected = pd.date_range(out[date_column].min(), out[date_column].max(), freq="D")
+        observed = pd.DatetimeIndex(out[date_column])
+    else:
+        expected = pd.date_range(out[date_column].min(), out[date_column].max(), freq="MS")
+        observed = pd.DatetimeIndex(out[date_column])
+    if not observed.equals(expected):
+        raise ValueError(f"Dataset must have a continuous {frequency} date index.")
+    return out
+
+
+def normalize_daily_price_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the new daily market dataset to graph 1/2 model columns."""
+    original = frame.copy()
+    original.columns = [str(c).replace("\ufeff", "").strip() for c in original.columns]
+    if "timestamp" not in original.columns and "date" in original.columns:
+        original = original.rename(columns={"date": "timestamp"})
+    src = _canonicalize_source_columns(original)
+    if "timestamp" not in src.columns:
+        raise ValueError("Daily price dataset must include a 'date' or 'timestamp' column.")
+
+    out = pd.DataFrame()
+    out["timestamp"] = pd.to_datetime(src["timestamp"], errors="coerce").dt.normalize()
+    out["item_id"] = src["item_id"].astype(str) if "item_id" in src.columns else "AP_onion"
+    for state in STATE_CODES:
+        for measure in ("retail", "wholesale", "mandi_modal"):
+            canonical = PRICE_COLUMNS[state][measure]
+            if canonical not in src.columns:
+                raise ValueError(f"Missing daily price column for {state} {measure}.")
+            values = pd.to_numeric(src[canonical], errors="coerce")
+            old_name = f"{state}_{measure}_rs_kg"
+            if measure == "mandi_modal":
+                old_name = f"{state}_mandi_modal_rs_kg"
+            if old_name in original.columns and canonical not in original.columns:
+                values = values * 100.0
+            out[canonical] = values
+
+        arrival = QUANTITY_COLUMNS[state]["arrival"]
+        if arrival not in src.columns:
+            raise ValueError(f"Missing daily arrival column for {state}.")
+        values = pd.to_numeric(src[arrival], errors="coerce")
+        if f"{state}_arrival_t_day" in original.columns and arrival not in original.columns:
+            values = values * 10.0
+        out[arrival] = values
+
+    if out["item_id"].nunique() != 1:
+        raise ValueError("Daily graph dataset must contain one item_id and one aligned row per date.")
+    out["item_id"] = out["item_id"].astype(str)
+    return _validate_graph_frame(out[DAILY_GRAPH_COLUMNS], "timestamp", "D")
+
+
+def normalize_ap_monthly_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize monthly AP quantities, preserving their source tonnes/month units."""
+    src = frame.copy()
+    src.columns = [str(c).replace("\ufeff", "").strip() for c in src.columns]
+    if "month_start" not in src.columns:
+        raise ValueError("Monthly AP dataset must include a 'month_start' column.")
+    required = MONTHLY_GRAPH_COLUMNS[1:]
+    missing = [column for column in required if column not in src.columns]
+    if missing:
+        raise ValueError("Monthly AP dataset is missing columns: " + ", ".join(missing))
+    parsed = pd.to_datetime(src["month_start"], format="%b-%y", errors="coerce")
+    invalid = parsed.isna()
+    if invalid.any():
+        parsed.loc[invalid] = pd.to_datetime(src.loc[invalid, "month_start"], errors="coerce")
+
+    out = pd.DataFrame({
+        "month_start": parsed.dt.to_period("M").dt.to_timestamp(),
+        **{column: src[column] for column in required},
+    })
+    return _validate_graph_frame(out[MONTHLY_GRAPH_COLUMNS], "month_start", "MS")
+
+
+def _sync_graph_dataset(dataset_key: str, path: Path, table: str, frame: pd.DataFrame,
+                        date_column: str) -> None:
+    stat = path.stat()
+    resolved = str(path.resolve())
+    with connect() as conn:
+        _create_schema(conn)
+        state = conn.execute(
+            "SELECT source_path,source_mtime_ns,source_size FROM graph_dataset_sync_state WHERE dataset_key=?",
+            (dataset_key,),
+        ).fetchone()
+        if (state is not None and state["source_path"] == resolved
+                and int(state["source_mtime_ns"]) == int(stat.st_mtime_ns)
+                and int(state["source_size"]) == int(stat.st_size)):
+            return
+
+        columns = list(frame.columns)
+        quoted_columns = ",".join(f'"{column}"' for column in columns)
+        placeholders = ",".join("?" for _ in columns)
+        updates = ",".join(
+            f'"{column}"=excluded."{column}"'
+            for column in columns if column != date_column
+        )
+        records = []
+        for row in frame.itertuples(index=False, name=None):
+            values = list(row)
+            date_index = columns.index(date_column)
+            values[date_index] = pd.Timestamp(values[date_index]).strftime("%Y-%m-%d")
+            records.append(tuple(values))
+        conn.executemany(
+            f'INSERT INTO "{table}" ({quoted_columns}) VALUES ({placeholders}) '
+            f'ON CONFLICT("{date_column}") DO UPDATE SET {updates}',
+            records,
+        )
+        conn.execute("""INSERT INTO graph_dataset_sync_state
+            (dataset_key,source_path,source_mtime_ns,source_size,synced_at) VALUES(?,?,?,?,?)
+            ON CONFLICT(dataset_key) DO UPDATE SET source_path=excluded.source_path,
+            source_mtime_ns=excluded.source_mtime_ns,source_size=excluded.source_size,
+            synced_at=excluded.synced_at""",
+            (dataset_key, resolved, int(stat.st_mtime_ns), int(stat.st_size),
+             datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        )
+
+
+def load_daily_price_history() -> pd.DataFrame:
+    if not DAILY_PRICE_CSV_PATH.exists():
+        raise FileNotFoundError(f"Daily price dataset not found: {DAILY_PRICE_CSV_PATH}")
+    frame = normalize_daily_price_frame(
+        pd.read_csv(DAILY_PRICE_CSV_PATH, encoding="utf-8-sig"))
+    _sync_graph_dataset("daily_prices", DAILY_PRICE_CSV_PATH,
+                        "daily_price_observations", frame, "timestamp")
+    with connect() as conn:
+        quoted_columns = ",".join(f'"{column}"' for column in DAILY_GRAPH_COLUMNS)
+        stored = pd.read_sql_query(
+            f'SELECT {quoted_columns} FROM daily_price_observations ORDER BY timestamp',
+            conn,
+        )
+    stored["timestamp"] = pd.to_datetime(stored["timestamp"])
+    return stored
+
+
+def load_ap_monthly_history() -> pd.DataFrame:
+    if not AP_MONTHLY_CSV_PATH.exists():
+        raise FileNotFoundError(f"Monthly AP dataset not found: {AP_MONTHLY_CSV_PATH}")
+    frame = normalize_ap_monthly_frame(
+        pd.read_csv(AP_MONTHLY_CSV_PATH, encoding="utf-8-sig"))
+    _sync_graph_dataset("ap_monthly", AP_MONTHLY_CSV_PATH,
+                        "ap_monthly_observations", frame, "month_start")
+    with connect() as conn:
+        quoted_columns = ",".join(f'"{column}"' for column in MONTHLY_GRAPH_COLUMNS)
+        stored = pd.read_sql_query(
+            f'SELECT {quoted_columns} FROM ap_monthly_observations ORDER BY month_start',
+            conn,
+        )
+    stored["month_start"] = pd.to_datetime(stored["month_start"])
+    return stored
+
+
+def ensure_graph_datasets_ready() -> None:
+    """Import the configured graph datasets when their SQLite tables are empty."""
+    with connect() as conn:
+        _create_schema(conn)
+        daily_count = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM daily_price_observations").fetchone()["n"])
+        monthly_count = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM ap_monthly_observations").fetchone()["n"])
+    if daily_count == 0:
+        load_daily_price_history()
+    if monthly_count == 0:
+        load_ap_monthly_history()
 
 
 def normalize_source_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -320,6 +534,152 @@ def _validate_dash_updates(series_updates: dict[str, dict[str, float]]) -> None:
             numeric = float(value)
             if not math.isfinite(numeric):
                 raise ValueError(f"Non-finite value for {column} on {stamp}: {value!r}.")
+
+
+def upsert_dash_graph_observations(
+        series_updates: dict[str, dict[str, float]],
+        gap_dates: Iterable[str] | None = None,
+        update_existing: bool = True) -> dict[str, Any]:
+    """Mirror fetched Dash values into graph tables using their canonical units.
+
+    Daily graph rows are completed by carrying forward the preceding row. AP
+    monthly arrival totals are refreshed from daily quintals converted to tonnes;
+    production and consumption remain owned by the monthly source dataset.
+    """
+    _validate_dash_updates(series_updates)
+    daily_columns = set(DAILY_GRAPH_COLUMNS) - {"timestamp", "item_id"}
+    for stamp, columns in series_updates.items():
+        unknown = sorted(set(columns) - daily_columns)
+        if unknown:
+            raise ValueError(f"Columns are not part of daily_price_observations on {stamp}: {unknown}.")
+
+    requested_dates = sorted(set(series_updates) | set(gap_dates or []))
+    result: dict[str, Any] = {
+        "rows_inserted": 0,
+        "values_updated": 0,
+        "values_unchanged": 0,
+        "gap_rows_filled": 0,
+        "monthly_arrivals_updated": 0,
+        "monthly_arrival_months_missing": [],
+        "latest_observation_date": None,
+    }
+    if not requested_dates:
+        return result
+
+    monthly_arrival_column = QUANTITY_COLUMNS["AP"]["arrival"]
+    affected_months: set[str] = set()
+    insert_columns = ["timestamp", "item_id", *DAILY_GRAPH_COLUMNS[2:]]
+    insert_sql = (
+        f'INSERT INTO "daily_price_observations" '
+        f'({", ".join(chr(34) + column + chr(34) for column in insert_columns)}) '
+        f'VALUES ({", ".join("?" for _ in insert_columns)})'
+    )
+
+    with connect() as conn:
+        _create_schema(conn)
+        try:
+            for stamp in requested_dates:
+                sourced = series_updates.get(stamp, {})
+                if monthly_arrival_column in sourced:
+                    month = datetime.strptime(stamp, "%Y-%m-%d").replace(day=1)
+                    affected_months.add(month.strftime("%Y-%m-%d"))
+
+                existing = conn.execute(
+                    'SELECT * FROM "daily_price_observations" WHERE "timestamp"=?',
+                    (stamp,),
+                ).fetchone()
+                if existing is not None:
+                    changes: dict[str, float] = {}
+                    for column, raw_value in sourced.items():
+                        value = float(raw_value)
+                        old_value = float(existing[column])
+                        if abs(value - old_value) <= TOLERANCE:
+                            result["values_unchanged"] += 1
+                        elif update_existing:
+                            changes[column] = value
+                            result["values_updated"] += 1
+                    if changes:
+                        set_sql = ", ".join(f'"{column}"=?' for column in changes)
+                        conn.execute(
+                            f'UPDATE "daily_price_observations" SET {set_sql} WHERE "timestamp"=?',
+                            [*changes.values(), stamp],
+                        )
+                    continue
+
+                previous = conn.execute(
+                    'SELECT * FROM "daily_price_observations" WHERE "timestamp"<? '
+                    'ORDER BY "timestamp" DESC LIMIT 1',
+                    (stamp,),
+                ).fetchone()
+                if previous is None:
+                    raise ValueError(
+                        "daily_price_observations has no earlier row to carry forward; "
+                        "load the configured daily dataset before ingestion."
+                    )
+
+                previous_date = datetime.strptime(str(previous["timestamp"]), "%Y-%m-%d").date()
+                target_date = datetime.strptime(stamp, "%Y-%m-%d").date()
+                next_date = previous_date + timedelta(days=1)
+                while next_date <= target_date:
+                    day = next_date.strftime("%Y-%m-%d")
+                    day_existing = conn.execute(
+                        'SELECT * FROM "daily_price_observations" WHERE "timestamp"=?',
+                        (day,),
+                    ).fetchone()
+                    if day_existing is not None:
+                        previous = day_existing
+                    else:
+                        values = {column: previous[column] for column in insert_columns
+                                  if column not in ("timestamp", "item_id")}
+                        day_values = series_updates.get(day, {})
+                        values.update({column: float(value) for column, value in day_values.items()})
+                        conn.execute(insert_sql, [
+                            day,
+                            str(previous["item_id"]),
+                            *[values[column] for column in insert_columns[2:]],
+                        ])
+                        result["rows_inserted"] += 1
+                        if day_values:
+                            result["values_updated"] += len(day_values)
+                        else:
+                            result["gap_rows_filled"] += 1
+                        previous = conn.execute(
+                            'SELECT * FROM "daily_price_observations" WHERE "timestamp"=?',
+                            (day,),
+                        ).fetchone()
+                    next_date += timedelta(days=1)
+
+            for month_start in sorted(affected_months):
+                month_date = datetime.strptime(month_start, "%Y-%m-%d")
+                next_month = (month_date.replace(day=28) + timedelta(days=4)).replace(day=1)
+                monthly_row = conn.execute(
+                    'SELECT arrival_t_month FROM "ap_monthly_observations" WHERE month_start=?',
+                    (month_start,),
+                ).fetchone()
+                if monthly_row is None:
+                    result["monthly_arrival_months_missing"].append(month_start)
+                    continue
+                arrival_quintals = conn.execute(
+                    'SELECT COALESCE(SUM("AP_arrival_metric_quintal"), 0) AS total '
+                    'FROM "daily_price_observations" WHERE "timestamp">=? AND "timestamp"<?',
+                    (month_start, next_month.strftime("%Y-%m-%d")),
+                ).fetchone()["total"]
+                arrival_tonnes = float(arrival_quintals) / 10.0
+                if abs(arrival_tonnes - float(monthly_row["arrival_t_month"])) > TOLERANCE:
+                    conn.execute(
+                        'UPDATE "ap_monthly_observations" SET arrival_t_month=? WHERE month_start=?',
+                        (arrival_tonnes, month_start),
+                    )
+                    result["monthly_arrivals_updated"] += 1
+
+            latest = conn.execute(
+                'SELECT MAX("timestamp") AS latest FROM "daily_price_observations"').fetchone()["latest"]
+            result["latest_observation_date"] = str(latest) if latest else None
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return result
 
 
 def classify_dash_updates(series_updates: dict[str, dict[str, float]]) -> dict[str, Any]:
