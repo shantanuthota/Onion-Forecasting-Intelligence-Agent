@@ -125,11 +125,11 @@ Before turning polling on, the next implementation step is a source adapter that
 
 ## Automated 6-hourly UPAg Dash ingestion
 
-`pull_upag_dash.py` keeps the SQLite history current without any manual CSV work. Every run:
+`pull_upag_dash.py` keeps the SQLite history and daily price CSV current. Every run:
 
 1. Requests **yesterday's date** (Asia/Kolkata) from the public UPAg Dash MIP by-crop endpoint for all four states (AP, MH, KA, MP).
 2. Extracts the four sourced series per state — **retail, wholesale and mandi modal prices (Rs/Qtl, unconverted)** and **mandi arrivals (Tonnes ×10 → metric quintals)**.
-3. Appends dates that are missing, corrects single values that the source revised (logged in `data/corrections_log.csv`), and skips identical values — so the four runs per day are idempotent. Values are written to the legacy ingestion history and mirrored into `daily_price_observations` for the graph API.
+3. Appends dates that are missing, corrects single values that the source revised (logged in `data/corrections_log.csv`), and skips identical values — so the four runs per day are idempotent. Values are written to the legacy ingestion history, mirrored into `daily_price_observations` for the graph API, and synchronized into the configured daily price CSV.
 4. Forward-fills fields not supplied by this API on new daily rows, matching how the "Interpolated" dataset was built. AP daily arrivals are also rolled up from quintals/day to tonnes/month in the matching `ap_monthly_observations` row; monthly production and consumption remain sourced from the configured monthly dataset. If the DB lags behind yesterday, the window auto-extends back to `DB_last + 1` and unfilled dates become `upag_dash_6h_gapfill` rows so the daily index never breaks.
 
 Mapping provenance: every series was cross-checked against the ingested history on 2026-10-28 with anchor dates for all four states (e.g. AP 2022-01-01 retail 4000.0, MP 2023-06-18 wholesale 1205.45, MP arrivals 1219.35 T → 12193.5 qtl). A mismatch raises loudly and blocks ingestion (`dash_extract.ANCHORS`).
@@ -156,7 +156,7 @@ install above remains the default and is independent of the backend.
 
 Every run is auditable in `ingestion_log`, and raw responses are snapshotted under `data/snapshots/` (newest 30 kept). Environment switches live in `.env` (`UPAG_DASH_ENABLED`, `UPAG_DASH_DAYS`, `UPAG_DASH_SNAPSHOTS`, `UPAG_DASH_UPDATE_EXISTING`, …). Lock file `data/pull_upag_dash.lock` prevents overlapping runs. Offline tests: `pytest tests\test_dash_ingestion.py`.
 
-The scheduled job fetches UPAg Dash data and writes it directly to SQLite; it does not call the local FastAPI HTTP API. The API reads the updated database when its data endpoints are requested. If an AP monthly row is not yet present, the job reports that its arrival total could not be updated; it does not invent monthly production or consumption values.
+The scheduled job fetches UPAg Dash data and writes it to SQLite and the configured daily price CSV; it does not call the local FastAPI HTTP API. The monthly source CSV is unchanged; AP monthly arrivals are refreshed only in the SQLite graph table, while monthly production and consumption remain sourced from the configured monthly dataset. The API reads the updated database when its data endpoints are requested. If an AP monthly row is not yet present, the job reports that its arrival total could not be updated; it does not invent monthly production or consumption values.
 
 ## Chronos-2 output interpretation
 
@@ -164,6 +164,7 @@ The scheduled job fetches UPAg Dash data and writes it directly to SQLite; it do
 - P10–P90 is a nominal 80% prediction interval.
 - `interval_width_pct_of_median` is a forecast spread indicator, **not a calibrated confidence score**.
 - A reliability score requires rolling-origin backtests with actual held-out values for each horizon/state/price type.
+- Graph 1/2 forecast rows include a **derived** `confidence_score` per day: the probability that the actual price lands within ±`ONION_CONFIDENCE_TOLERANCE_PCT` (default ±5%) of the forecast median, computed from the Chronos-2 P10/P90 spread after stretching it by `ONION_CONFIDENCE_SPREAD_K` (default 1.2 — an uncalibrated placeholder until the rolling-origin backtest above supplies calibrated values). Calibration reference point: when the P10/P90 distances equal the band width and `k=1`, the score is exactly the nominal 80. The score is a cumulative minimum across forecast dates within each series, so it can only stay level or fall with horizon.
 
 ## Run tests without model downloads
 

@@ -99,6 +99,7 @@ def forecast_hover_data(forecast: pd.DataFrame) -> tuple[Any, str]:
         "change_rs_kg",
         "change_percent",
         "change_direction",
+        "confidence_score",
     ]
     if not all(field in forecast.columns for field in fields):
         return None, "Date: %{x}<br>P50: ₹%{y:.2f}/kg<extra></extra>"
@@ -108,6 +109,7 @@ def forecast_hover_data(forecast: pd.DataFrame) -> tuple[Any, str]:
         "<br>Latest actual: ₹%{customdata[0]:.2f}/kg"
         "<br>Change: %{customdata[1]:+.2f} ₹/kg"
         "<br>Change: %{customdata[2]:+.2f}% (%{customdata[3]})"
+        "<br>Confidence: %{customdata[4]:.1f}%"
         "<extra></extra>"
     )
 
@@ -300,11 +302,17 @@ if payload1:
                     f"₹{actual:.2f}/kg" if pd.notna(actual) else "Unavailable",
                     delta=delta,
                 )
+                confidence = forecast_row.get("confidence_score")
+                confidence_text = (
+                    f" · Confidence {confidence:.1f}%"
+                    if confidence is not None and pd.notna(confidence)
+                    else ""
+                )
                 col.caption(
                     f"Baseline {actual_date or 'unavailable'} · First forecast "
                     f"₹{forecast_row['predicted_price_rs_kg']:.2f}/kg "
                     f"({forecast_row['date']}) · P10 ₹{forecast_row['p10_rs_kg']:.2f} "
-                    f"· P90 ₹{forecast_row['p90_rs_kg']:.2f}"
+                    f"· P90 ₹{forecast_row['p90_rs_kg']:.2f}{confidence_text}"
                 )
         with st.expander("Forecast rows / API values"):
             st.dataframe(fdf, use_container_width=True, hide_index=True)
@@ -400,6 +408,7 @@ if payload2:
             "change_rs_kg",
             "change_percent",
             "change_direction",
+            "confidence_score",
         ]
         missing_fields = [field for field in comparison_fields if field not in fdf2.columns]
         if missing_fields:
@@ -426,6 +435,7 @@ if payload2:
                         "change_rs_kg",
                         "change_percent",
                         "change_direction",
+                        "confidence_score",
                     ]
                 ],
                 use_container_width=True,
@@ -620,3 +630,301 @@ else:
     st.info("Select states, choose a horizon and click Update supply / demand outlook.")
 st.markdown('<hr class="section-rule"/>', unsafe_allow_html=True)
 st.caption("Visual QA dashboard. The production frontend should call the same FastAPI endpoints. Weather / El Niño / cyclone scenarios are intentionally not included yet.")
+
+# ---------------------------------------------------------------------------
+# 🧅 Onion Intelligence — floating read-only chat widget (Architecture A)
+#    Bottom-right FAB toggles an overlay chat panel in the same space.
+#    Only new code is appended here; every section above is unchanged.
+# ---------------------------------------------------------------------------
+import json as _chat_json  # local alias to avoid touching top-of-file imports
+
+
+CHAT_OPEN_KEY = "chat_open"
+CHAT_SID_KEY = "chat_session_id"
+CHAT_MSGS_KEY = "chat_msgs"
+CHAT_PICK_KEY = "chat_history_pick"
+CHAT_PANEL_TITLE = "🧅 Onion Intelligence"
+
+
+def _chat_token() -> str:
+    return os.getenv("API_BEARER_TOKEN", "").strip()
+
+
+def _chat_post(message: str) -> dict:
+    token = _chat_token()
+    if not token:
+        raise RuntimeError("API_BEARER_TOKEN is missing from the dashboard environment.")
+    response = requests.post(
+        f"{api_base}/api/chat",
+        json={"message": message, "session_id": st.session_state.get(CHAT_SID_KEY)},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=1800,
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"message": response.text[:400]}
+    if not response.ok:
+        detail = body.get("message") or body.get("detail")
+        if isinstance(detail, dict):
+            detail = detail.get("message") or _chat_json.dumps(detail, ensure_ascii=False)
+        raise RuntimeError(str(detail) or f"HTTP {response.status_code}")
+    return body
+
+
+def _chat_sessions_list(limit: int = 12) -> list[dict]:
+    token = _chat_token()
+    if not token:
+        return []
+    try:
+        response = requests.get(
+            f"{api_base}/api/chat/sessions", params={"limit": limit},
+            headers={"Authorization": f"Bearer {token}"}, timeout=30,
+        )
+        if response.ok:
+            return response.json().get("sessions", [])
+    except Exception:
+        pass
+    return []
+
+
+def _chat_load_history(session_id: str) -> list[dict]:
+    token = _chat_token()
+    if not token:
+        return []
+    try:
+        response = requests.get(
+            f"{api_base}/api/chat/history", params={"session_id": session_id},
+            headers={"Authorization": f"Bearer {token}"}, timeout=30,
+        )
+        if response.ok:
+            rows = response.json().get("messages", [])
+            return [{"role": r["role"], "content": r["content"], "chart": None,
+                     "tools_used": _chat_json.loads(r.get("tools_used") or "[]"),
+                     "warnings": []} for r in rows]
+    except Exception:
+        pass
+    return []
+
+
+def _render_chat_chart(chart_payload: dict) -> None:
+    """Draw the graph payload returned by the chat API (same contract as Graphs 1/2/3)."""
+    graph = chart_payload.get("graph")
+    if graph in ("ap_price_forecast", "state_price_comparison"):
+        forecast_df = pd.DataFrame(chart_payload.get("forecast", []))
+        history_df = pd.DataFrame(chart_payload.get("historical", []))
+        fig = go.Figure()
+        if not forecast_df.empty:
+            color_by_type = dict(PRICE_COLORS)
+            for (state, price_type) in sorted(
+                    forecast_df[["state", "price_type"]].drop_duplicates().itertuples(index=False, name=None)):
+                color = color_by_type.get(price_type, "#4469a8")
+                group = f"{state}-{price_type}"
+                forecast = forecast_df[(forecast_df["state"] == state) & (forecast_df["price_type"] == price_type)].sort_values("date")
+                if not history_df.empty and {"state", "price_type"} <= set(history_df.columns):
+                    actual = history_df[(history_df["state"] == state) & (history_df["price_type"] == price_type)].sort_values("date")
+                    if not actual.empty:
+                        fig.add_trace(go.Scatter(
+                            x=actual["date"], y=actual["actual_price_rs_kg"], mode="lines",
+                            name=f"{state} · {price_type} · actual",
+                            line={"color": color, "width": 2},
+                            hovertemplate="%{x}<br>Actual ₹%{y:.2f}/kg<extra></extra>"))
+                fig.add_trace(go.Scatter(x=forecast["date"], y=forecast["p90_rs_kg"], mode="lines",
+                                         line={"color": color, "width": 1, "dash": "dot"},
+                                         showlegend=False, legendgroup=group,
+                                         hovertemplate="%{x}<br>Upper bound: ₹%{y:.2f}/kg<extra></extra>"))
+                fig.add_trace(go.Scatter(x=forecast["date"], y=forecast["p10_rs_kg"], mode="lines",
+                                         line={"color": color, "width": 1, "dash": "dot"},
+                                         fill="tonexty",
+                                         fillcolor="rgba(68,105,168,0.13)", showlegend=False,
+                                         legendgroup=group,
+                                         hovertemplate="%{x}<br>Lower bound: ₹%{y:.2f}/kg<extra></extra>"))
+                confidence = forecast["confidence_score"] if "confidence_score" in forecast else None
+                confidence_line = "<br>Confidence score: %{customdata:.1f}%" if confidence is not None else ""
+                fig.add_trace(go.Scatter(x=forecast["date"], y=forecast["p50_rs_kg"],
+                                         mode="lines", name=f"{state} · {price_type} · predicted price",
+                                         line={"color": color, "width": 2.4, "dash": "dash"},
+                                         customdata=confidence,
+                                         legendgroup=group,
+                                         hovertemplate="%{x}<br>Predicted price: ₹%{y:.2f}/kg"
+                                         + confidence_line + "<extra></extra>"))
+            st.caption("The shaded band shows the lower-to-upper forecast range.")
+        threshold = chart_payload.get("threshold_rs_kg")
+        if threshold:
+            fig.add_hline(y=threshold, line_dash="dot", line_color="#a05a5a",
+                          annotation_text=f"₹{threshold}/kg",
+                          annotation_font_color="#a05a5a")
+        configure_chart(fig, y_title="Price (₹/kg)", height=380)
+        st.plotly_chart(fig, use_container_width=True)
+    elif graph == "supply_demand_shortfall":
+        quantity_df = pd.DataFrame(chart_payload.get("quantity_forecast", []))
+        balance_df = pd.DataFrame(chart_payload.get("balance_forecast", []))
+        fig = go.Figure()
+        colors = {"production": "#18846B", "consumption": "#4469A8", "arrival": "#C78422"}
+        if not quantity_df.empty:
+            for metric in ("production", "consumption", "arrival"):
+                series = quantity_df[quantity_df["metric"] == metric].sort_values("date")
+                if series.empty:
+                    continue
+                fig.add_trace(go.Scatter(
+                    x=series["date"], y=series["predicted_quantity_tonnes_month"],
+                    mode="lines+markers", name=f"Predicted {metric}",
+                    line={"color": colors[metric], "width": 2.2, "dash": "dash"},
+                    hovertemplate="%{x|%b %Y}<br>%{y:,.0f} t/month<extra></extra>"))
+        if not balance_df.empty:
+            fig.add_trace(go.Bar(
+                x=balance_df["date"], y=balance_df["shortfall_p50_tonnes_month"],
+                name="Predicted shortfall", marker_color="#A63D40",
+                hovertemplate="%{x|%b %Y}<br>Predicted shortfall: %{y:,.1f} t/month<extra></extra>"))
+        configure_chart(fig, y_title="Tonnes per month", height=380)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        rows = (chart_payload.get("forecast")
+                or chart_payload.get("forecast_values")
+                or chart_payload.get("rows"))
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("This answer has no chartable rows.")
+
+
+def _render_chat_message(item: dict) -> None:
+    with st.chat_message("user" if item.get("role") == "user" else "assistant"):
+        st.markdown(item.get("content", ""))
+        chart = item.get("chart")
+        if chart:
+            with st.expander("📊 Show forecast chart", expanded=False):
+                _render_chat_chart(chart)
+        tools_used = item.get("tools_used") or []
+        if tools_used:
+            st.caption("🔧 " + ", ".join(tools_used))
+        for warning in item.get("warnings") or []:
+            st.caption("⚠️ " + str(warning))
+
+
+def _chat_css() -> None:
+    is_open = bool(st.session_state.get(CHAT_OPEN_KEY))
+    hide = "" if is_open else "  div.st-key-chat_panel { display: none; }"
+    st.markdown(f"""
+<style>
+  /* Floating chat FAB */
+  div.st-key-chat_fab {{ position: fixed !important; bottom: 24px !important; right: 24px !important;
+      z-index: 9999; width: auto !important; height: auto !important; }}
+  div.st-key-chat_fab button {{ display: flex; align-items: center; justify-content: center;
+      width: auto !important; min-width: 168px; height: 54px; min-height: 54px;
+      padding: 0 20px; border-radius: 999px; font-size: 16px; font-weight: 700;
+      line-height: 1.2; white-space: nowrap;
+      box-shadow: 0 8px 24px rgba(15,35,65,.32); background: #174a7e; color: #fff;
+      border: 2px solid #fff; }}
+  div.st-key-chat_fab button:hover {{ background: #10385f; color: #fff;
+      border-color: #fff; transform: translateY(-2px); }}
+  div.st-key-chat_fab button:focus-visible {{ outline: 3px solid #f4a340; outline-offset: 3px; }}
+  /* Floating chat panel */
+  div.st-key-chat_panel {{ position: fixed; bottom: 80px; right: 18px; z-index: 9998;
+      display: flex; flex-direction: column; width: min(470px, calc(100vw - 36px));
+      height: min(660px, 78vh); min-height: 240px; overflow: hidden;
+      background: #ffffff; border: 1px solid #dfe4ec; border-radius: 16px;
+      padding: 14px 16px 10px; box-shadow: 0 18px 50px rgba(22,28,40,.25); }}
+  div.st-key-chat_panel > [data-testid="stLayoutWrapper"]:has(.st-key-chat_messages) {{
+      flex: 1 1 auto; min-height: 0; overflow: hidden; }}
+  div.st-key-chat_panel div.st-key-chat_messages {{ height: 100%; min-height: 0;
+      overflow-y: auto; overflow-x: hidden; }}
+  div.st-key-chat_panel [data-testid="stElementContainer"].st-key-chat_input {{
+      flex: 0 0 auto; padding-top: 8px; background: #fff; }}
+  @media (max-width: 540px) {{
+    div.st-key-chat_fab {{ bottom: 16px !important; right: 16px !important; }}
+    div.st-key-chat_panel {{ width: calc(100vw - 24px); right: 12px; bottom: 78px;
+        height: min(660px, calc(100vh - 100px)); }}
+  }}
+{hide}
+</style>
+""", unsafe_allow_html=True)
+
+
+st.session_state.setdefault(CHAT_OPEN_KEY, False)
+st.session_state.setdefault(CHAT_SID_KEY, None)
+st.session_state.setdefault(CHAT_MSGS_KEY, [])
+
+_chat_css()
+
+# FAB — bottom-right, toggles the panel.
+fab_label = "✕ Close chat" if st.session_state.get(CHAT_OPEN_KEY) else "💬 Ask Onion AI"
+if st.button(fab_label, key="chat_fab", use_container_width=False):
+    st.session_state[CHAT_OPEN_KEY] = not st.session_state.get(CHAT_OPEN_KEY, False)
+    st.rerun()
+
+panel = st.container(key="chat_panel", border=False)
+with panel:
+    if st.session_state.get(CHAT_OPEN_KEY):
+        st.markdown(f'<div class="chat-panel-title">{CHAT_PANEL_TITLE}</div>', unsafe_allow_html=True)
+        st.caption("Read-only assistant · forecasts & history via your Graph APIs")
+
+        new_chat, history_pick, _spacer = st.columns([1.1, 2.2, 0.8])
+        with new_chat:
+            if st.button("New chat", key="chat_new", use_container_width=False):
+                st.session_state[CHAT_SID_KEY] = None
+                st.session_state[CHAT_MSGS_KEY] = []
+                st.session_state[CHAT_PICK_KEY] = "＋ New chat"
+                st.rerun()
+        with history_pick:
+            saved = _chat_sessions_list()
+            option_by_id = {}
+            options = ["＋ New chat"]
+            for session_row in saved:
+                label = f"{session_row.get('title', 'chat')} · {str(session_row.get('updated_at', ''))[:16]}"
+                options.append(label)
+                option_by_id[label] = session_row["session_id"]
+            pick = st.selectbox(
+                "History", options, key="chat_pick",
+                index=options.index(st.session_state.get(CHAT_PICK_KEY, "＋ New chat"))
+                if st.session_state.get(CHAT_PICK_KEY, "＋ New chat") in options else 0,
+                label_visibility="collapsed",
+            )
+            if pick != st.session_state.get(CHAT_PICK_KEY, "＋ New chat"):
+                st.session_state[CHAT_PICK_KEY] = pick
+                if pick == "＋ New chat":
+                    st.session_state[CHAT_SID_KEY] = None
+                    st.session_state[CHAT_MSGS_KEY] = []
+                else:
+                    session_id = option_by_id.get(pick)
+                    st.session_state[CHAT_SID_KEY] = session_id
+                    st.session_state[CHAT_MSGS_KEY] = _chat_load_history(session_id)
+                st.rerun()
+
+        chat_items = st.session_state.get(CHAT_MSGS_KEY, [])
+        with st.container(key="chat_messages"):
+            if chat_items:
+                for item in chat_items:
+                    _render_chat_message(item)
+            else:
+                st.caption("Ask a question to start chatting about onion prices and supply.")
+
+        prompt = st.chat_input("Ask about onion prices, supply or freshness…",
+                               key="chat_input", max_chars=2000)
+        if prompt:
+            user_item = {"role": "user", "content": prompt, "chart": None,
+                         "tools_used": [], "warnings": []}
+            st.session_state[CHAT_MSGS_KEY].append(user_item)
+            _render_chat_message(user_item)
+            with st.chat_message("assistant"):
+                with st.spinner("🧅 Thinking…"):
+                    try:
+                        body = _chat_post(prompt)
+                        st.session_state[CHAT_SID_KEY] = body.get("session_id", st.session_state.get(CHAT_SID_KEY))
+                        assistant_item = {
+                            "role": "assistant",
+                            "content": body.get("answer") or "_Empty answer._",
+                            "chart": body.get("chart"),
+                            "tools_used": body.get("tools_used") or [],
+                            "warnings": body.get("warnings") or [],
+                        }
+                    except Exception as chat_error:
+                        assistant_item = {
+                            "role": "assistant",
+                            "content": f"⚠️ Chat failed: {chat_error}",
+                            "chart": None, "tools_used": [], "warnings": [],
+                        }
+            st.session_state[CHAT_MSGS_KEY].append(assistant_item)
+            _render_chat_message(assistant_item)
+    else:
+        st.caption("Open the chat with the 🧅 button at the bottom-right.")

@@ -7,12 +7,16 @@ forecasts remain in tonnes per month.
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import hashlib
 import hmac
 import json
 import logging
+import math
 import os
-from datetime import date
+import time
+from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -38,6 +42,14 @@ logger = logging.getLogger("onion-forecast-api")
 MODEL_ID = os.getenv("CHRONOS_MODEL_ID", "amazon/chronos-2")
 MAX_FORECAST_HORIZON_DAYS = 180
 QUANTILES = [0.1, 0.5, 0.9]
+# Derived per-day forecast confidence (tolerance-band probability). The spread
+# multiplier k scales the Chronos-2 P10/P90 spread; replace the placeholder 1.2
+# with the backtest-calibrated value and set ONION_CONFIDENCE_K_CALIBRATED=1
+# once rolling-origin backtests have run.
+CONFIDENCE_SPREAD_K = float(os.getenv("ONION_CONFIDENCE_SPREAD_K", "1.2"))
+CONFIDENCE_TOLERANCE_PCT = float(os.getenv("ONION_CONFIDENCE_TOLERANCE_PCT", "0.05"))
+CONFIDENCE_K_CALIBRATED = os.getenv("ONION_CONFIDENCE_K_CALIBRATED", "").strip() == "1"
+Z90 = 1.2815515655446004  # standard normal z-score of the 0.9 quantile
 ALLOWED_HORIZONS = (7, 14, 30, 60, 90, 180)
 PRICE_TYPES = {"RETAIL": "retail",
                "WHOLESALE": "wholesale", "MANDI_MODAL": "mandi_modal"}
@@ -53,15 +65,8 @@ app = FastAPI(
     ),
 )
 
-
-app = FastAPI(
-    title="Onion Forecasting MVP API",
-    version="3.0.0",
-    description=(
-        "Graph-specific Chronos-2 forecasts. Historical price observations are stored in ₹/metric quintal; "
-        "forecasted prices are converted to ₹/kg and persisted to SQLite."
-    ),
-)
+# Chatbot (Architecture A): read-only Groq tool-calling assistant over /api/chat.
+from chatbot.chat_router import router as chat_router  # noqa: E402
 
 # Register CORS AFTER the authentication middleware.
 allowed_origins = [
@@ -77,6 +82,27 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+app.include_router(chat_router)
+
+
+# Startup event: pre-warm the Chronos-2 pipeline so the first user request does not
+# trigger a cold-start download/init (latency fix #1). We also log the warm-up time.
+@app.add_event_handler("startup")
+async def _prewarm_model_on_startup():
+    start = time.time()
+    logger.info("Pre-warming Chronos-2 pipeline at server startup...")
+    try:
+        # Force pipeline initialization without a full prediction (just load weights).
+        pipeline = get_pipeline()
+        logger.info(
+            "Chronos-2 pipeline pre-warmed in %.1fs on %s (model=%s)",
+            time.time() - start,
+            pipeline.device if hasattr(pipeline, "device") else "unknown",
+            MODEL_ID,
+        )
+    except Exception:
+        logger.exception("Failed to pre-warm Chronos-2 pipeline; forecasts will be slower until first successful call.")
 
 
 @app.middleware("http")
@@ -185,6 +211,13 @@ def _actual_end_date(requested_end_date: date) -> date:
     return min(requested_end_date, date.today())
 
 
+def _run_async(blocking_func, *args, **kwargs):
+    """Offload blocking inference to the default ThreadPoolExecutor (latency fix #4)."""
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        return loop.run_in_executor(pool, blocking_func, *args, **kwargs)
+
+
 def _forecast_display_start_date(
     data: pd.DataFrame, start_date: date, end_date: date
 ) -> date | None:
@@ -216,8 +249,11 @@ def _frame_hash(frame: pd.DataFrame) -> str:
     return hashlib.sha256(pd.util.hash_pandas_object(frame, index=True).values.tobytes()).hexdigest()[:24]
 
 
-_PREDICTION_CACHE: dict[str, pd.DataFrame] = {}
-_CACHE_LIMIT = 64
+# Prediction cache with both size limit and time-based TTL (prevents stale results
+# from persisting indefinitely and keeps memory bounded under concurrent load).
+_PREDICTION_CACHE: dict[str, tuple[pd.DataFrame, float]] = {}
+_PREDICTION_CACHE_TTL_SEC = 3600  # 1 hour TTL; refresh after ingestion changes
+_PREDICTION_CACHE_MAX_SIZE = 256
 
 
 def _run_target(data: pd.DataFrame, target: str, horizon: int,
@@ -254,8 +290,12 @@ def _run_target(data: pd.DataFrame, target: str, horizon: int,
                 status_code=500, detail=f"Future covariate forecast missing values for target {target}.")
     key = "|".join([_frame_hash(context), _frame_hash(
         future), target, str(horizon), freq, MODEL_ID])
+    # Check cache with TTL: stale entries beyond TTL are ignored (not deleted here
+    # to avoid mutation during concurrent reads; eviction is lazy on write).
     if key in _PREDICTION_CACHE:
-        return _PREDICTION_CACHE[key].copy(deep=True)
+        cached_df, cached_at = _PREDICTION_CACHE[key]
+        if (time.time() - cached_at) < _PREDICTION_CACHE_TTL_SEC:
+            return cached_df.copy(deep=True)
     try:
         pipeline = get_pipeline()
         result = pipeline.predict_df(
@@ -281,9 +321,12 @@ def _run_target(data: pd.DataFrame, target: str, horizon: int,
         raise HTTPException(
             status_code=500, detail=f"Chronos-2 output missing columns: {sorted(missing)}")
     result["timestamp"] = pd.to_datetime(result["timestamp"])
-    if len(_PREDICTION_CACHE) >= _CACHE_LIMIT:
-        _PREDICTION_CACHE.pop(next(iter(_PREDICTION_CACHE)))
-    _PREDICTION_CACHE[key] = result.copy(deep=True)
+    # Eviction: if over max size, drop oldest (by insertion time). With concurrent
+    # access we rely on Python's dict ordering being insertion-ordered (CPython 3.7+).
+    while len(_PREDICTION_CACHE) >= _PREDICTION_CACHE_MAX_SIZE:
+        oldest_key = next(iter(_PREDICTION_CACHE))
+        _PREDICTION_CACHE.pop(oldest_key)
+    _PREDICTION_CACHE[key] = (result.copy(deep=True), time.time())
     return result
 
 
@@ -330,19 +373,53 @@ def _quantile_values(row: pd.Series) -> tuple[float, float, float]:
     return min(p10, p50), p50, max(p50, p90)
 
 
+def _normal_cdf(value: float) -> float:
+    """Standard normal CDF Phi(x). Identical to scipy.special.ndtr without SciPy."""
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def _confidence_score(q10: float, median: float, q90: float) -> float:
+    """Derived per-day confidence: probability (0-100, one decimal) that the actual
+    value stays within +/-CONFIDENCE_TOLERANCE_PCT of the forecast median.
+
+    1) The Chronos-2 spread around the median is stretched by the backtest
+       calibration multiplier CONFIDENCE_SPREAD_K.
+    2) Each side's calibrated distance (median->P10, median->P90) is treated as a
+       one-sided 0.90-quantile distance and converted to a sigma via Z90.
+    3) The probability mass inside the [median*(1-tol), median*(1+tol)] band of
+       that asymmetric normal is the per-day confidence.
+    """
+    calibrated_q10 = median + CONFIDENCE_SPREAD_K * (q10 - median)
+    calibrated_q90 = median + CONFIDENCE_SPREAD_K * (q90 - median)
+    calibrated_q10 = min(calibrated_q10, median)
+    calibrated_q90 = max(calibrated_q90, median)
+    s_lo = max((median - calibrated_q10) / Z90, 1e-9)
+    s_hi = max((calibrated_q90 - median) / Z90, 1e-9)
+    band_half = CONFIDENCE_TOLERANCE_PCT * abs(median)
+    p_up = max(0.0, min(0.5, _normal_cdf(band_half / s_hi) - 0.5))
+    p_down = max(0.0, min(0.5, 0.5 - _normal_cdf(-band_half / s_lo)))
+    score = (p_up + p_down) * 100.0
+    return round(max(0.0, min(100.0, score)), 1)
+
+
 def _price_forecast_records(data: pd.DataFrame, state: str, price_type: str, result: pd.DataFrame) -> list[dict]:
     col = PRICE_COLUMNS[state][price_type]
     latest_row = data.loc[pd.to_datetime(data["timestamp"]).idxmax()]
     latest_actual_price_rs_kg = float(latest_row[col]) / 100.0
     latest_actual_date = pd.Timestamp(latest_row["timestamp"]).date().isoformat()
 
-    records = []
+    records: list[dict] = []
+    running_min_confidence = float("inf")
     for _, row in result.sort_values("timestamp").iterrows():
         q10, q50, q90 = _quantile_values(row)
         # Source and model units are INR/metric quintal. Convert ONLY forecast outputs to INR/kg.
         p10, p50, p90 = q10 / 100.0, q50 / 100.0, q90 / 100.0
         width = p90 - p10
         change_rs_kg = p50 - latest_actual_price_rs_kg
+        # Per-day confidence from the calibrated spread. The score is a cumulative
+        # minimum across forecast dates (it may only stay level or decrease with
+        # horizon), matching the pred["confidence_score"].cummin() post-process.
+        running_min_confidence = min(running_min_confidence, _confidence_score(q10, q50, q90))
 
         records.append({
             "date": pd.Timestamp(row["timestamp"]).date().isoformat(),
@@ -368,8 +445,23 @@ def _price_forecast_records(data: pd.DataFrame, state: str, price_type: str, res
             "p90_rs_kg": round(p90, 4),
             "prediction_interval_width_rs_kg": round(width, 4),
             "interval_width_pct_of_median": round(width / max(abs(p50), 1e-9) * 100, 2),
+            "confidence_score": round(running_min_confidence, 1),
         })
     return records
+
+
+def _overall_confidence_scores(forecast: list[dict]) -> dict[str, float | None]:
+    """Aggregate per-day confidence scores from a forecast array."""
+    scores = [float(r["confidence_score"]) for r in forecast if r.get("confidence_score") is not None]
+    if not scores:
+        return {"overall_confidence_score": None, "minimum_confidence_score": None,
+                "final_confidence_score": None, "forecast_points_for_overall": 0}
+    return {
+        "overall_confidence_score": round(sum(scores) / len(scores), 1),
+        "minimum_confidence_score": round(min(scores), 1),
+        "final_confidence_score": round(scores[-1], 1),
+        "forecast_points_for_overall": len(scores),
+    }
 
 
 def _history_price_records(
@@ -438,7 +530,19 @@ def _metadata() -> dict:
             "forecast_price_unit": "INR/kg", "quantity_unit": "metric quintals/day",
             "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
             "prediction_interval": {"nominal_coverage": 0.8, "description": "P10–P90 is a nominal central 80% prediction interval, not a guarantee."},
-            "confidence_score": {"available": False, "reason": "Chronos-2 returns forecast quantiles, not a native calibrated scalar confidence score."}}
+            "confidence_score": {"available": True,
+                                 "method": "tolerance_band_probability",
+                                 "applies_to": "Graph 1/2 daily price forecast rows",
+                                 "description": ("Derived per-day probability (%) that the actual price stays within "
+                                                 f"±{CONFIDENCE_TOLERANCE_PCT * 100:.0f}% of the forecast median, assuming an "
+                                                 "asymmetric normal built from the Chronos-2 P10/P90 spread scaled by "
+                                                 f"the spread multiplier k={CONFIDENCE_SPREAD_K}. Monotone (non-increasing) "
+                                                 "across forecast dates per series."),
+                                 "spread_multiplier_k": CONFIDENCE_SPREAD_K,
+                                 "tolerance_band_pct": CONFIDENCE_TOLERANCE_PCT * 100,
+                                 "calibrated": CONFIDENCE_K_CALIBRATED,
+                                 "note": ("k is an uncalibrated placeholder; when the backtest supplies calibrated "
+                                          "values, set ONION_CONFIDENCE_SPREAD_K=<k> and ONION_CONFIDENCE_K_CALIBRATED=1.")}}
 
 
 @app.get("/")
@@ -497,7 +601,7 @@ def sync_csv_endpoint(filename: str = Query(..., description="CSV filename alrea
 
 
 @app.get("/api/graphs/ap-retail")
-def ap_retail_graph(
+async def ap_retail_graph(
         price_types: str = Query(
             "retail", description="Comma-separated retail, wholesale, mandi_modal"),
         start_date: date = Query(...,
@@ -518,15 +622,28 @@ def ap_retail_graph(
     horizon_days = _date_range_horizon(data, start_date, end_date)
     forecast: list[dict] = []
     context_cols: list[str] = []
-    for price_type in selected:
-        context_cols.extend(_price_context_columns("AP", price_type))
+    # Latency fix #3: parallel inference for multi-series using ThreadPoolExecutor.
+    # Each _price_target_forecast releases the GIL during torch inference, so
+    # concurrent threads run on the GPU in parallel.
+    def _forecast_for_type(price_type: str) -> tuple[list[str], list[dict]]:
+        cols = _price_context_columns("AP", price_type)
         if horizon_days and forecast_display_start:
             result = _price_target_forecast(data, "AP", price_type, horizon_days)
-            forecast.extend(_filter_date_records(
+            records = _filter_date_records(
                 _price_forecast_records(data, "AP", price_type, result),
                 forecast_display_start,
                 forecast_limit_end,
-            ))
+            )
+        else:
+            records = []
+        return cols, records
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(selected) or 1)) as executor:
+        futures = [executor.submit(_forecast_for_type, pt) for pt in selected]
+        for future in concurrent.futures.as_completed(futures):
+            cols, records = future.result()
+            context_cols.extend(cols)
+            forecast.extend(records)
     historical = []
     for price_type in selected:
         historical.extend(_history_price_records(
@@ -561,7 +678,7 @@ def ap_retail_graph(
 
 
 @app.get("/api/graphs/state-comparison")
-def state_comparison_graph(
+async def state_comparison_graph(
     states: str = Query("AP,KA,MH,MP"),
     price_types: str = Query("retail,wholesale,mandi_modal"),
     start_date: date = Query(...,
@@ -586,22 +703,28 @@ def state_comparison_graph(
     forecast: list[dict] = []
     historical: list[dict] = []
     context_cols: list[str] = []
-    for state in selected_states:
-        for price_type in selected_types:
-            context_cols.extend(_price_context_columns(state, price_type))
+    # Latency fix #3 (continued): parallel multi-state/multi-price inference.
+    # Collect all (state, price_type, context_cols, records) in parallel, then build lists.
+    def _forecast_pair(args):
+        state, price_type = args
+        cols = _price_context_columns(state, price_type)
+        records = []
+        hist = []
+        if horizon_days and forecast_display_start:
+            result = _price_target_forecast(data, state, price_type, horizon_days)
+            records = _filter_date_records(
+                _price_forecast_records(data, state, price_type, result),
+                forecast_display_start, forecast_limit_end)
+        hist.extend(_history_price_records(data, state, price_type, start_date, actual_end_date))
+        return cols, records, hist
 
-            if horizon_days and forecast_display_start:
-                result = _price_target_forecast(
-                    data, state, price_type, horizon_days)
-                forecast.extend(_filter_date_records(
-                    _price_forecast_records(data, state, price_type, result),
-                    forecast_display_start,
-                    forecast_limit_end,
-                ))
-            historical.extend(
-                _history_price_records(
-                    data, state, price_type, start_date, actual_end_date)
-            )
+    pairs = [(s, p) for s in selected_states for p in selected_types]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(pairs) or 1)) as executor:
+        results = list(executor.map(_forecast_pair, pairs))
+    for cols, records, hist in results:
+        context_cols.extend(cols)
+        forecast.extend(records)
+        historical.extend(hist)
 
     saved = (
         _persist_prices(
@@ -789,6 +912,11 @@ def supply_balance_graph(
         **_metadata(),
         "frequency": "monthly",
         "quantity_unit": "tonnes/month",
+        "confidence_score": {
+            "available": False,
+            "reason": ("The tolerance-band confidence is implemented for Graph 1/2 daily price rows; "
+                       "Graph 3 combines component forecasts, so a per-day score is not applied yet."),
+        },
     }
     return {"graph": "supply_demand_shortfall", "title": "Andhra Pradesh Monthly Supply-Demand Balance Forecast",
             "selected_states": selected_states, "selected_state_names": [STATE_NAMES[x] for x in selected_states],

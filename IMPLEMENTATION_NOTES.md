@@ -26,6 +26,19 @@ The same input hierarchy is applied independently for each selected state: retai
 - `shortfall = consumption - (arrival + production)`; positive values mean potential shortfall, negative values mean potential surplus.
 - Shortfall is derived from the three component forecasts and stored alongside them. It is not a separate Chronos target.
 
+## Latency prevention (implemented 2026)
+
+To prevent first-request delays and concurrent-load slowdowns:
+
+1. **Startup pre-warm** (`@app.on_event("startup")` calls `get_pipeline()`): eliminates cold-start model download/init on the first user request. Logs warm-up time.
+2. **Prediction cache** (`_PREDICTION_CACHE`, max 256, 1h TTL): keeps recent forecasts in memory and evicts stale entries; avoids re-computing identical (context + future + target + horizon) predictions.
+3. **Parallel multi-series inference** (`ThreadPoolExecutor` in `ap-retail` and `state-comparison` loops): concurrent predictions for multiple price types / states since each `predict_df()` releases the GIL.
+4. **Async endpoints** (`async def` on `/api/graphs/*`): concurrent API requests are handled in parallel instead of queued synchronously.
+5. **Data paths fixed** (`.env`): `ONION_DAILY_PRICE_DATA_PATH` and `ONION_AP_MONTHLY_DATA_PATH` point to the correct `data/*.csv` files so requests never hang on missing CSV lookups.
+6. **Post-deploy warm-up script** (`scripts/warmup.py`): hits all 3 common endpoints after restart to pre-fill the cache and confirm pipeline health.
+
+These changes should make the API responsive for concurrent users from the first request onward. Monitor server logs for the `"Pre-warming Chronos-2 pipeline"` line to confirm warm-up succeeds.
+
 ## Forecast persistence
 
 Every successful graph endpoint call creates a row in `forecast_runs` and saves its forecast quantiles in `forecast_values`. Each saved value has graph run, state, target, forecast date, P10/P50/P90 and unit. Price forecast values are stored in INR/kg; Graph 3 quantities and shortfall are stored in tonnes/month. Inspect them with:

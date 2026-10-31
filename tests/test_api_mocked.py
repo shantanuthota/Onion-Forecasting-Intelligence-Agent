@@ -160,6 +160,24 @@ def test_graph1_retail_uses_only_requested_context_and_converts_forecast(monkeyp
     assert latest is not None and latest["forecast_values"][0]["unit"] == "INR/kg"
 
 
+def test_graph1_confidence_score_is_present_bounded_and_monotone(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    response = client.get(
+        "/api/graphs/ap-retail?price_types=retail,wholesale&start_date=2026-10-27&end_date=2026-11-29",
+        headers={"Authorization": "Bearer test-api-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    rows = response.json()["forecast"]
+    assert len(rows) == 64
+    for price_type in ("retail", "wholesale"):
+        scores = [row["confidence_score"] for row in rows if row["price_type"] == price_type]
+        assert len(scores) == 32
+        assert all(0.0 <= score <= 100.0 for score in scores)
+        # Cumulative minimum: the score never increases with the forecast horizon.
+        assert all(earlier >= later for earlier, later in zip(scores, scores[1:]))
+
+
 def test_new_graph_datasets_are_loaded_into_sqlite(monkeypatch, tmp_path):
     client_with_fake(monkeypatch, tmp_path)
 

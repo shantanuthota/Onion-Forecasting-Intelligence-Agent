@@ -1,0 +1,167 @@
+# ThisIsTheBeginning
+
+Complete application architecture diagram — Onion Forecasting Intelligence Agent
+(Architecture A — Groq tool-calling assistant over existing Graph 1/2/3 APIs).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              EXTERNAL WORLD                                   │
+│  UPAg Dash (6-hour ingestion)  │  User (Streamlit browser)  │  React Client   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │                        │
+                                      ▼                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           FASTAPI SERVER (main.py)                           │
+│  ┌───────────────────────────────────────────────────────────────────────┐    │
+│  │  AUTH MIDDLEWARE (Bearer token) — protects ALL /api/* routes        │    │
+│  │  • /api/forecast/*  (Graph 1 AP prices / Graph 2 state comparison)     │    │
+│  │  • /api/forecast/supply-balance  (Graph 3 — AP ONLY)                  │    │
+│  │  • /api/chat  (chatbot read-only)                                     │    │
+│  │  • /api/chat/stream  (SSE)                                            │    │
+│  │  • /api/chat/sessions  (memory list)                                 │    │
+│  │  • /api/chat/history  (session messages)                             │    │
+│  └───────────────────────────────────────────────────────────────────────┘    │
+│                                      │                                        │
+│  ┌───────────────────────────────────┼──────────────────────────────────┐   │
+│  ▼                                   ▼                                  │   │
+│  CHATBOT (chatbot/)                 GRAPH HANDLERS                        │   │
+│  • agent.py  (Groq brain)           • ap_retail_graph()                 │   │
+│  • tools.py  (6 read-only tools)    • state_comparison_graph()         │   │
+│  • prompts.py  (system prompt)      • supply_balance_graph()             │   │
+│  • sessions.py  (SQLite memory)    • _history_price_records()          │   │
+│  • chat_router.py  (API routes)     • ingestion_status()                 │   │
+│                                      • get_latest_forecast()              │   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │                                        │
+                                      ▼                                        │
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         DATA / PERSISTENCE LAYER                             │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │  SQLITE (data/onion_forecasting_v4.sqlite3)  — WAL mode                 │  │
+│  │  EXISTING TABLES (untouched by chatbot)                                 │  │
+│  │  • observations  (daily price observations — AP/KA/MH/MP)                │  │
+│  │  • forecast_runs  (Graph 1/2/3 saved predictions)                      │  │
+│  │  • forecast_values  (P10 / P50 / P90 per state/target)                  │  │
+│  │  • ingestion_log  (last UPAg dash sync timestamp)                     │  │
+│  │                                                                          │  │
+│  │  NEW CHATBOT TABLES (CREATE IF NOT EXISTS — zero impact on existing)    │  │
+│  │  • chat_sessions  (session_id, title auto-set from first user msg)     │  │
+│  │  • chat_messages  (user/assistant roles; chart payload NOT persisted)   │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│                                      │                                        │
+│  CSV DATA (project data/)             │  PULL_UPAG_DASH (ingestion)           │
+│  • Onion_Daily_Price..._2022-01...  │  • 6-hourly scheduled task            │
+│  • Onion_AP_Monthly..._2022-01...   │  • writes to SQLite observations      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │                                        │
+                                      ▼                                        │
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           CHRONOS-2 PREDICTOR                                │
+│  • Model: amazon/chronos-2 (env: CHRONOS_MODEL_ID)                           │
+│  • Input: historical rows from observations table                           │
+│  • Output: prediction_length=180 (days cap) · quantiles=[0.1, 0.5, 0.9]     │
+│  • Confidence: uncalibrated spread k=1.2 (ONION_CONFIDENCE_SPREAD_K)         │
+│  • Forecast rows include: date, state, price_type, p10, p50, p90, change%  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+GROQ LLM BRAIN (Architecture A — read-only assistant)
+┌──────────────────────────────────────────────────────────────────────────┐
+│  PRIMARY  →  llama-3.3-70b-versatile  (CHAT_LLM_MODEL)                     │
+│  FALLBACK →  llama-3.1-8b-instant    (CHAT_LLM_FALLBACK_MODEL)             │
+│  ENDPOINT →  https://api.groq.com/openai/v1  (OpenAI-compatible SDK)      │
+│  KEY      →  GROQ_API_KEY  (.env — user-provided; placeholder if empty)    │
+│  CONFIG   →  temperature=0.2 · max_rounds=4 · timeout=60s · redaction=1    │
+└──────────────────────────────────────────────────────────────────────────┘
+
+CHATBOT FLOW (read-only — zero ingestion triggers)
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌─────────────┐
+│  User msg   │─────►  agent.run_  │─────►  Groq LLM    │─────►  Tool call?│
+│  (≤2000chr) │     │  chat()      │     │  (system +   │     │  (≤4 rounds)│
+└─────────────┘     │  • build     │     │   history +  │     └──────┬──────┘
+                   │    messages  │     │   user msg)  │            │
+                   │  • fetch     │     └──────┬───────┘            │
+                   │    session / │            │                    │
+                   │    history   │            ▼                    ▼
+                   │  • persist   │     ┌──────────────┐     ┌─────────────┐
+                   │    user msg  │     │  No tool     │     │  Execute    │
+                   │              │     │  call → final│     │  6 tools    │
+                   └──────────────┘     │  answer text │     │  (in-proc)  │
+                                         └──────┬───────┘     └──────┬──────┘
+                                                │                     │
+                                                ▼                     ▼
+                                         ┌──────────────┐     ┌─────────────┐
+                                         │  Redact:     │     │  COMPACT    │
+                                         │  verify ₹/%  │─────►  JSON → LLM │
+                                         │  numbers vs  │     │  (≤~800 tkn)│
+                                         │  tool data   │     └──────┬──────┘
+                                         └──────┬───────┘            │
+                                                │                     │
+                                                ▼                     ▼
+                                         ┌──────────────┐     ┌─────────────┐
+                                         │  Answer +    │     │  FULL graph │
+                                         │  warnings    │◄────│  payload →  │
+                                         │  (markdown)  │     │  "chart"    │
+                                         └──────┬───────┘     └─────────────┘
+                                                │
+                                                ▼
+                                         ┌──────────────┐
+                                         │  Persist     │
+                                         │  assistant   │
+                                         │  message to  │
+                                         │  chat_       │
+                                         │  messages    │
+                                         └──────┬───────┘
+                                                │
+                              ┌─────────────────┴──────────────────────┐
+                              ▼                                        ▼
+                    ┌──────────────────────┐              ┌──────────────────────┐
+                    │  RESPONSE (JSON)     │              │  STREAMLIT WIDGET     │
+                    │  {session_id,        │              │  (dashboard.py)       │
+                    │   answer,            │              │  • 🧅 FAB bottom-rt   │
+                    │   format="markdown", │              │  • Toggle overlay     │
+                    │   chart,             │              │  • History picker     │
+                    │   chart_display=     │              │  • Chat bubbles       │
+                    │     "collapsed",     │              │  • st.chat_input      │
+                    │   tools_used,        │              │  • Toggle-only chart  │
+                    │   session_title,     │              │    expander          │
+                    │   warnings}          │              │  • Error bubbles      │
+                    └──────────────────────┘              │    (503 when key     │
+                                                          │     missing)         │
+                                                          └──────────────────────┘
+
+READ-ONLY RULES (hard-coded in agent.py + prompts.py)
+• NO ingestion-trigger tool exists.
+• NO modification to observations / forecast_runs / ingestion_log.
+• Staleness → report with refresh instructions (scheduled task / pull_upag_dash).
+• Numbers from tools only; redaction replaces unknown ₹/% with "…".
+• Forecast range capped at 180 days.
+• Graph 3 (supply balance) = AP ONLY.
+• confidence_score = uncalibrated placeholder (k=1.2) — must say so.
+
+FILES ADDED / MODIFIED (from this build)
+NEW PACKAGES:
+  chatbot/__init__.py
+  chatbot/prompts.py         (system prompt + final nudge)
+  chatbot/sessions.py        (chat_sessions / chat_messages DDL + CRUD)
+  chatbot/tools.py           (6 tool schemas + executors + compactors)
+  chatbot/agent.py           (Groq client + fallback chain + redaction)
+  chatbot/chat_router.py     (POST /api/chat + GET sessions + GET history + POST stream)
+
+MODIFIED EXISTING:
+  main.py          (remove duplicate app block; import + include chat_router)
+  dashboard.py     (append floating widget block only — nothing above removed)
+  requirements.txt (+ openai>=1.4; installed 3.42.0)
+  .env             (+ GROQ_ENABLED, GROQ_API_KEY=empty, CHAT_*, GROQ_BASE_URL)
+  .env.example     (+ same chat variables documented)
+
+NEW DOCS / TESTS:
+  CHATBOT_INTEGRATION.md  (this file — contract for React team)
+  tests/test_chatbot.py    (18 offline tests — scripted brain, no network)
+  .opencode/plan/onion-chatbot-architecture-a.md  (existing blueprint — unchanged)
+
+DEPLOY STATE:
+  • .env holds real GROQ_API_KEY (user-provided).
+  • Without the key: POST /api/chat returns 503 (message + hint) — confirmed.
+  • With the key set to real value: real Groq calls proceed (primary → retry → fallback).
+  • All /api/* endpoints automatically protected by Bearer middleware.
+  • SQLite DB = same file; chat tables create on first use via IF NOT EXISTS.

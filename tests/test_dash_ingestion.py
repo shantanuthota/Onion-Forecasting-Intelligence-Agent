@@ -348,6 +348,25 @@ def _isolate_paths(tmp_path: Path, monkeypatch) -> None:
             (month_start, production_t_month, consumption_t_month, arrival_t_month)
             VALUES('2026-10-01', 52000, 69000, 3000)"""
         )
+    daily_source = pd.DataFrame([tuple(row) for row in source_rows], columns=daily_columns)
+    daily_csv = pd.DataFrame({
+        "date": [
+            f"{stamp.month}/{stamp.day}/{stamp.year}"
+            for stamp in pd.to_datetime(daily_source["timestamp"])
+        ],
+    })
+    for state in history_store.STATE_CODES:
+        for measure in ("retail", "wholesale", "mandi_modal"):
+            canonical = history_store.PRICE_COLUMNS[state][measure]
+            raw_column = (f"{state}_{measure}_rs_kg" if measure != "mandi_modal"
+                          else f"{state}_mandi_modal_rs_kg")
+            daily_csv[raw_column] = daily_source[canonical] / 100.0
+        daily_csv[f"{state}_arrival_t_day"] = (
+            daily_source[history_store.QUANTITY_COLUMNS[state]["arrival"]] / 10.0
+        )
+    daily_path = tmp_path / "daily_prices.csv"
+    daily_csv.to_csv(daily_path, index=False)
+    monkeypatch.setattr(history_store, "DAILY_PRICE_CSV_PATH", daily_path)
 
 
 def test_run_once_dry_run_writes_nothing(tmp_path, monkeypatch):
@@ -413,6 +432,12 @@ def test_run_once_writes_graph_tables_in_their_dataset_units(tmp_path, monkeypat
     assert daily["AP_retail_rs_per_metric_quintal"] == pytest.approx(4100.0)
     assert daily["AP_arrival_metric_quintal"] == pytest.approx(20.0)
     assert daily["MP_retail_rs_per_metric_quintal"] == pytest.approx(4000.0)
+    daily_csv = pd.read_csv(history_store.DAILY_PRICE_CSV_PATH)
+    latest_csv = daily_csv.iloc[-1]
+    assert pd.to_datetime(latest_csv["date"]).date().isoformat() == "2026-10-27"
+    assert latest_csv["AP_retail_rs_kg"] == pytest.approx(41.0)
+    assert latest_csv["AP_arrival_t_day"] == pytest.approx(2.0)
+    assert latest_csv["MP_retail_rs_kg"] == pytest.approx(40.0)
     assert monthly["production_t_month"] == pytest.approx(52000.0)
     assert monthly["consumption_t_month"] == pytest.approx(69000.0)
     assert monthly["arrival_t_month"] == pytest.approx(3002.0)
@@ -458,6 +483,9 @@ def test_run_once_second_run_reports_no_inserts(tmp_path, monkeypatch):
     assert exit_code == 0
     assert len(history_store.load_history()) == 4
     assert observation_row("2026-10-27")[MP_RETAIL] == pytest.approx(2605.0)
+    daily_csv = pd.read_csv(history_store.DAILY_PRICE_CSV_PATH)
+    assert len(daily_csv) == 4
+    assert pd.to_datetime(daily_csv["date"]).max().date().isoformat() == "2026-10-27"
 
 
 def test_run_once_applies_correction_from_source(tmp_path, monkeypatch):

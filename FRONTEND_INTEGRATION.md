@@ -24,7 +24,7 @@ the selected display-range length. When a request is truncated, the API warning 
 - `threshold_rs_kg`: optional horizontal chart threshold in INR/kg; defaults to `44`.
 - Response field `threshold_rs_kg`: the effective threshold value used for the chart.
 - `historical`: `date`, `state`, `price_type`, `actual_price_rs_kg`.
-- `forecast`: `date`, `state`, `price_type`, `latest_actual_date`, `latest_actual_price_rs_kg`, `predicted_price_rs_kg`, `change_rs_kg`, `change_percent`, `change_direction`, `p10_rs_kg`, `p50_rs_kg`, `p90_rs_kg`, `prediction_interval_width_rs_kg`, `interval_width_pct_of_median`.
+- `forecast`: `date`, `state`, `price_type`, `latest_actual_date`, `latest_actual_price_rs_kg`, `predicted_price_rs_kg`, `change_rs_kg`, `change_percent`, `change_direction`, `p10_rs_kg`, `p50_rs_kg`, `p90_rs_kg`, `prediction_interval_width_rs_kg`, `interval_width_pct_of_median`, `confidence_score`.
 - Top-level date/status fields include `visible_start_date`, `visible_end_date`, `actual_end_date`, `requested_end_date`, `last_observation_date`, `data_staleness_days`, `forecast_start_date`, `forecast_end_date`, and `warnings`.
 - If `forecast_truncated` is true, the chart should show the warning and use the returned forecast rows through `forecast_limit_date`; `forecast_end_date` is the last actual forecast point.
 - `saved_to_sqlite`: run ID and number of saved quantile rows.
@@ -33,6 +33,9 @@ Target logic:
 - retail uses past AP retail, wholesale, mandi modal, and arrivals; unknown future covariates are forecast first.
 - wholesale uses past AP wholesale, mandi modal, and arrivals; unknown future covariates are forecast first.
 - mandi modal uses past AP mandi modal and arrivals; unknown future arrivals are forecast first.
+
+Derived confidence:
+- Every forecast row includes `confidence_score`, a per-day probability (%) that the actual price stays within a tolerance band (±5% by default) of the forecast median. The Chronos-2 P10/P90 spread is scaled by `ONION_CONFIDENCE_SPREAD_K` (uncalibrated placeholder 1.2 until a rolling-origin backtest supplies the calibrated value), converted to an asymmetric per-side sigma, and the probability mass inside the band is reported 0–100. The score is monotone non-increasing across forecast dates within each series. `metadata.confidence_score` in each response documents the method, `k`, and band parameters.
 
 ## Graph 2 — state comparison
 

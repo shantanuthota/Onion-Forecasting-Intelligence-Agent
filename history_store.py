@@ -27,12 +27,8 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 DEFAULT_CSV = ROOT / "data" / "Onion_Model_Ready_Dataset_Chronos2_2026-10-26_Interpolated_Metric_Quintal.csv"
-DEFAULT_DAILY_PRICE_CSV = Path(
-    r"C:\Users\shant\Downloads\Onion_Daily_Price_Forecasting_Dataset_2022-01-01_to_2026-10-25.csv"
-)
-DEFAULT_AP_MONTHLY_CSV = Path(
-    r"C:\Users\shant\Downloads\Onion_AP_Monthly_Dataset_2022-01_to_2026-10.csv"
-)
+DEFAULT_DAILY_PRICE_CSV = ROOT / "data" / "Onion_Daily_Price_Forecasting_Dataset_2022-01-01_to_2026-10-25.csv"
+DEFAULT_AP_MONTHLY_CSV = ROOT / "data" / "Onion_AP_Monthly_Dataset_2022-01_to_2026-10.csv"
 STATE_CODES = ("AP", "KA", "MH", "MP")
 STATE_NAMES = {"AP": "Andhra Pradesh", "KA": "Karnataka", "MH": "Maharashtra", "MP": "Madhya Pradesh"}
 
@@ -334,6 +330,121 @@ def load_daily_price_history() -> pd.DataFrame:
         )
     stored["timestamp"] = pd.to_datetime(stored["timestamp"])
     return stored
+
+
+def sync_daily_price_csv_from_graph(dates: Iterable[str]) -> dict[str, int]:
+    """Persist selected SQLite daily graph rows back to the configured source CSV."""
+    stamps = sorted({str(stamp) for stamp in dates})
+    result = {"rows_appended": 0, "values_updated": 0}
+    if not stamps:
+        return result
+
+    path = DAILY_PRICE_CSV_PATH
+    if not path.is_file():
+        raise FileNotFoundError(f"Daily price dataset not found: {path}")
+    source = pd.read_csv(path, encoding="utf-8-sig")
+    date_column = "date" if "date" in source.columns else "timestamp"
+    if date_column not in source.columns:
+        raise ValueError("Daily price dataset must include a 'date' or 'timestamp' column.")
+    source_dates = pd.to_datetime(source[date_column], errors="coerce").dt.normalize()
+    if source_dates.isna().any() or source_dates.duplicated().any():
+        raise ValueError("Daily price dataset contains invalid or duplicate dates.")
+    normalize_daily_price_frame(source)
+
+    with connect() as conn:
+        quoted_columns = ",".join(f'"{column}"' for column in DAILY_GRAPH_COLUMNS)
+        graph = pd.read_sql_query(
+            f'SELECT {quoted_columns} FROM daily_price_observations ORDER BY timestamp',
+            conn,
+        )
+    graph["timestamp"] = pd.to_datetime(graph["timestamp"]).dt.normalize()
+    graph_by_date = {
+        row["timestamp"].strftime("%Y-%m-%d"): row
+        for row in graph.to_dict(orient="records")
+    }
+
+    column_map: dict[str, tuple[str, float]] = {}
+    for state in STATE_CODES:
+        for measure in ("retail", "wholesale", "mandi_modal"):
+            canonical = PRICE_COLUMNS[state][measure]
+            legacy = (f"{state}_{measure}_rs_kg" if measure != "mandi_modal"
+                      else f"{state}_mandi_modal_rs_kg")
+            if canonical in source.columns:
+                column_map[canonical] = (canonical, 1.0)
+            elif legacy in source.columns:
+                column_map[canonical] = (legacy, 100.0)
+            else:
+                raise ValueError(f"Daily price dataset is missing column {canonical}.")
+
+        canonical_arrival = QUANTITY_COLUMNS[state]["arrival"]
+        arrival_candidates = (
+            (canonical_arrival, 1.0),
+            (f"{state}_arrival_mq", 1.0),
+            (f"{state}_arrival_t", 1.0),
+            (f"{state}_arrival_t_day", 10.0),
+        )
+        for column, scale in arrival_candidates:
+            if column in source.columns:
+                column_map[canonical_arrival] = (column, scale)
+                break
+        else:
+            raise ValueError(f"Daily price dataset is missing column {canonical_arrival}.")
+
+    source_index = {
+        stamp.strftime("%Y-%m-%d"): index
+        for index, stamp in enumerate(source_dates)
+    }
+    updated = source.copy()
+    new_rows = []
+    date_sample = str(source.iloc[0][date_column])
+    for stamp in stamps:
+        graph_row = graph_by_date.get(stamp)
+        if graph_row is None:
+            raise ValueError(f"SQLite daily graph history is missing {stamp}.")
+
+        index = source_index.get(stamp)
+        if index is None:
+            date = pd.Timestamp(stamp).date()
+            row = {column: pd.NA for column in source.columns}
+            row[date_column] = (f"{date.month}/{date.day}/{date.year}"
+                                if "/" in date_sample else date.isoformat())
+            if "item_id" in row:
+                row["item_id"] = graph_row["item_id"]
+            for canonical, (source_column, scale) in column_map.items():
+                row[source_column] = float(graph_row[canonical]) / scale
+            new_rows.append(row)
+            result["rows_appended"] += 1
+            continue
+
+        for canonical, (source_column, scale) in column_map.items():
+            value = float(graph_row[canonical]) / scale
+            old_value = pd.to_numeric(
+                pd.Series([updated.at[index, source_column]]), errors="coerce"
+            ).iloc[0]
+            if pd.isna(old_value) or not math.isclose(
+                    float(old_value), value, rel_tol=0.0, abs_tol=1e-12):
+                updated.at[index, source_column] = value
+                result["values_updated"] += 1
+        if "item_id" in updated.columns:
+            updated.at[index, "item_id"] = graph_row["item_id"]
+
+    if new_rows:
+        updated = pd.concat([updated, pd.DataFrame(new_rows, columns=source.columns)], ignore_index=True)
+    sort_dates = pd.to_datetime(updated[date_column], errors="coerce")
+    if sort_dates.isna().any():
+        raise ValueError("Daily price dataset contains invalid dates after synchronization.")
+    updated = updated.loc[sort_dates.sort_values(kind="stable").index].reset_index(drop=True)
+    normalize_daily_price_frame(updated)
+    if updated.equals(source):
+        return result
+
+    temporary_path = path.with_name(path.name + ".tmp")
+    try:
+        updated.to_csv(temporary_path, index=False)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return result
 
 
 def load_ap_monthly_history() -> pd.DataFrame:

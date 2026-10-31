@@ -132,7 +132,8 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
       "p50_rs_kg": 34.20,
       "p90_rs_kg": 38.80,
       "prediction_interval_width_rs_kg": 8.70,
-      "interval_width_pct_of_median": 25.44
+      "interval_width_pct_of_median": 25.44,
+      "confidence_score": 32.6
     }
   ],
   "metadata": {
@@ -147,8 +148,14 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
       "description": "P10–P90 is a nominal central 80% prediction interval, not a guarantee."
     },
     "confidence_score": {
-      "available": false,
-      "reason": "Chronos-2 returns forecast quantiles, not a native calibrated scalar confidence score."
+      "available": true,
+      "method": "tolerance_band_probability",
+      "applies_to": "Graph 1/2 daily price forecast rows",
+      "description": "Derived per-day probability (%) that the actual price stays within ±5% of the forecast median, computed from the Chronos-2 P10/P90 spread stretched by the calibration factor k. Monotone (non-increasing) across forecast dates per series.",
+      "spread_multiplier_k": 1.2,
+      "tolerance_band_pct": 5.0,
+      "calibrated": false,
+      "note": "k=1.2 is an uncalibrated placeholder; when backtests supply calibrated values, set ONION_CONFIDENCE_SPREAD_K=<k> and ONION_CONFIDENCE_K_CALIBRATED=1."
     }
   },
   "saved_to_sqlite": {
@@ -232,7 +239,8 @@ GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start
       "p50_rs_kg": 26.50,
       "p90_rs_kg": 30.10,
       "prediction_interval_width_rs_kg": 6.90,
-      "interval_width_pct_of_median": 26.04
+      "interval_width_pct_of_median": 26.04,
+      "confidence_score": 31.9
     }
   ],
   "metadata": {
@@ -247,8 +255,14 @@ GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start
       "description": "P10–P90 is a nominal central 80% prediction interval, not a guarantee."
     },
     "confidence_score": {
-      "available": false,
-      "reason": "Chronos-2 returns forecast quantiles, not a native calibrated scalar confidence score."
+      "available": true,
+      "method": "tolerance_band_probability",
+      "applies_to": "Graph 1/2 daily price forecast rows",
+      "description": "Derived per-day probability (%) that the actual price stays within ±5% of the forecast median, computed from the Chronos-2 P10/P90 spread stretched by the calibration factor k. Monotone (non-increasing) across forecast dates per series.",
+      "spread_multiplier_k": 1.2,
+      "tolerance_band_pct": 5.0,
+      "calibrated": false,
+      "note": "k=1.2 is an uncalibrated placeholder; when backtests supply calibrated values, set ONION_CONFIDENCE_SPREAD_K=<k> and ONION_CONFIDENCE_K_CALIBRATED=1."
     }
   },
   "saved_to_sqlite": {
@@ -375,7 +389,7 @@ GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-
     },
     "confidence_score": {
       "available": false,
-      "reason": "Chronos-2 returns forecast quantiles, not a native calibrated scalar confidence score."
+      "reason": "The tolerance-band confidence is implemented for Graph 1/2 daily price rows; Graph 3 combines component forecasts, so a per-day score is not applied yet."
     }
   },
   "warnings": [
@@ -682,3 +696,199 @@ intercepted. Leave the CSV import endpoint on its separate `X-Ingestion-Key`.
 | `422 Unprocessable Entity` | Parameter validation error | Missing/malformed dates, `start_date` after `end_date`, an end date that produces an invalid forecast horizon, negative threshold, unsupported state/price type, or invalid CSV data. |
 | `500 Internal Server Error` | Execution error | Missing required column in SQLite, or Chronos-2 pipeline failure. |
 | `503 Service Unavailable` | Service or Model not ready | Model dependencies missing, `API_BEARER_TOKEN` is not configured for protected API routes, or a unique `INGESTION_API_KEY` has not been configured for CSV import. |
+
+---
+
+## 6. Chatbot API (Postman and Frontend)
+
+The chatbot is a read-only natural-language interface over the existing onion
+forecast/history tools. It does not expose a separate login or user identity API.
+All four routes below require the same `API_BEARER_TOKEN` used by the other `/api/*`
+routes.
+
+### Postman setup
+
+1. Start the API server (for example, `start_api.bat`) and set `API_BEARER_TOKEN` in
+   the server's `.env`. Set `GROQ_API_KEY` as well, and ensure `GROQ_ENABLED=1`.
+2. In Postman, create environment variables:
+
+   | Variable | Example |
+   |---|---|
+   | `api_base_url` | `http://127.0.0.1:8000` |
+   | `api_token` | The exact value configured as `API_BEARER_TOKEN` |
+
+3. For each request, set **Authorization → Bearer Token** to `{{api_token}}`.
+   For JSON requests, set `Content-Type: application/json`.
+4. Send the first chat turn, copy its returned `session_id` into
+   `chat_session_id`, then use that value in follow-up turns and history requests.
+
+The bearer token is a server secret. Do not embed it in browser JavaScript or a
+public frontend build. A browser frontend should call its own backend/proxy, which
+adds `Authorization: Bearer <API_BEARER_TOKEN>` when calling this API.
+
+### Endpoint quick reference
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/chat` | Send a message and receive a complete answer (recommended for Postman). |
+| `POST` | `/api/chat/stream` | Receive the answer as Server-Sent Events (SSE). |
+| `GET` | `/api/chat/sessions?limit=20` | List recent sessions, newest activity first. |
+| `GET` | `/api/chat/history?session_id={{chat_session_id}}&limit=100` | Read messages in one session, oldest first within the selected slice. |
+
+### 1. Send a message — `POST /api/chat`
+
+Postman URL: `{{api_base_url}}/api/chat`
+
+```json
+{
+  "message": "What is the AP retail onion price forecast for next week?",
+  "session_id": null,
+  "wants_chart": null
+}
+```
+
+`message` is required, must contain non-whitespace text, and is limited to 2,000
+characters by default (`CHAT_MAX_INPUT_CHARS` can change this). Omit `session_id` or
+send `null` to start a conversation. For subsequent messages, pass the `session_id`
+returned by the previous response. An unknown session ID starts a new session.
+`wants_chart` is optional and currently does not force or suppress a chart; a chart is
+attached when the assistant uses a graph/forecast tool.
+
+Example response:
+
+```json
+{
+  "session_id": "d56f9cde8e98496397a0aa54c32dd180",
+  "answer": "The AP retail forecast is ...",
+  "answer_format": "markdown",
+  "chart": null,
+  "chart_display": "collapsed",
+  "tools_used": ["forecast_ap_prices"],
+  "session_title": "What is the AP retail onion price forecast for next week?",
+  "warnings": []
+}
+```
+
+`chart` is either `null` or a graph payload using the existing Graph 1/2/3 response
+contract. `tools_used` contains tool names selected for the turn; it can be empty for
+a conversational answer. `warnings` may report unavailable tool data or values
+redacted because they could not be verified. Session titles are derived from the first
+message and limited to 48 characters.
+
+Postman **Tests** script for saving the returned session automatically:
+
+```javascript
+pm.test("Chat turn succeeds", function () {
+  pm.response.to.have.status(200);
+  const body = pm.response.json();
+  pm.expect(body.session_id).to.be.a("string");
+  pm.environment.set("chat_session_id", body.session_id);
+});
+```
+
+Follow-up request body:
+
+```json
+{
+  "message": "And what about wholesale?",
+  "session_id": "{{chat_session_id}}"
+}
+```
+
+### 2. Stream a response — `POST /api/chat/stream`
+
+Postman URL: `{{api_base_url}}/api/chat/stream`. Use the same headers and request
+body as `/api/chat`; add `Accept: text/event-stream`.
+
+The response uses `Content-Type: text/event-stream`. Each event is a `data:` line
+containing one JSON object, followed by a blank line. Possible events:
+
+```text
+data: {"stage":"thinking"}
+
+data: {"chunk":"The AP retail forecast is ..."}
+
+data: {"chart":{"graph":"ap_price_forecast","...":"graph response fields"}}
+
+data: {"done":{"session_id":"d56f9cde8e98496397a0aa54c32dd180","tools_used":["forecast_ap_prices"],"session_title":"AP retail forecast","warnings":[]}}
+
+```
+
+The `chunk` event is optional/repeated. A final successful event contains `done`.
+Failures produced after the stream starts use
+`data: {"stage":"error","detail":"..."}`. Authentication failures (and missing API
+token configuration) are ordinary HTTP `401`/`503` responses before the stream.
+
+**Streaming note:** the current implementation completes the assistant/tool turn
+before emitting answer chunks. The chunks divide the completed answer into pieces;
+they are not live tokens emitted while the model is generating.
+
+### 3. List sessions — `GET /api/chat/sessions`
+
+Postman URL: `{{api_base_url}}/api/chat/sessions?limit=20`
+
+`limit` is optional (default `20`, range `1`–`100`).
+
+```json
+{
+  "sessions": [
+    {
+      "session_id": "d56f9cde8e98496397a0aa54c32dd180",
+      "title": "AP retail forecast",
+      "created_at": "2026-10-31T12:00:00+00:00",
+      "updated_at": "2026-10-31T12:01:00+00:00",
+      "user_label": null,
+      "messages_count": 2
+    }
+  ]
+}
+```
+
+### 4. Read session history — `GET /api/chat/history`
+
+Postman URL:
+`{{api_base_url}}/api/chat/history?session_id={{chat_session_id}}&limit=100`
+
+`session_id` is required. `limit` is optional (default `100`, range `1`–`200`).
+History is returned oldest-first for the selected newest-message slice. `tools_used`
+is stored/returned as a JSON-encoded string; `chart_kind` may be `null`. Full chart
+payloads are not persisted.
+
+```json
+{
+  "session_id": "d56f9cde8e98496397a0aa54c32dd180",
+  "messages": [
+    {
+      "id": 1,
+      "role": "user",
+      "content": "What is the AP retail onion price forecast for next week?",
+      "tools_used": "[]",
+      "chart_kind": null,
+      "created_at": "2026-10-31T12:00:00+00:00"
+    },
+    {
+      "id": 2,
+      "role": "assistant",
+      "content": "The AP retail forecast is ...",
+      "tools_used": "[\"forecast_ap_prices\"]",
+      "chart_kind": "ap_price_forecast",
+      "created_at": "2026-10-31T12:01:00+00:00"
+    }
+  ]
+}
+```
+
+### Chatbot errors
+
+| HTTP status | Example / meaning |
+|---|---|
+| `401` | Missing/invalid bearer token: `{"detail":"Invalid or missing bearer token."}` |
+| `404` | History session not found: `{"detail":"Chat session not found."}` |
+| `422` | Empty/overlong message or invalid query parameters. |
+| `503` | Chat disabled, Groq key missing/unavailable, or API bearer token not configured. Chat-specific failures include a `detail.message` and setup hint. |
+| `500` | Unexpected synchronous chat failure; check API server logs. |
+
+The chatbot calls Groq and therefore requires a valid `GROQ_API_KEY`; its primary and
+fallback models and other limits are configurable using the `CHAT_*` settings in
+`.env` (see `.env.example`). No chatbot tool triggers CSV ingestion or modifies
+forecast data.

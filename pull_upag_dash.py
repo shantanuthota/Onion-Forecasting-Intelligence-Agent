@@ -303,7 +303,8 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
                 if not args.dry_run:
                     history_store.record_sync(f"{SOURCE_DEFAULT}:{state}", "error", message=str(exc))
 
-        ingestion = {"inserted": 0, "updated": 0, "unchanged": 0, "gap_filled": 0}
+        ingestion = {"inserted": 0, "updated": 0, "unchanged": 0, "gap_filled": 0,
+                     "daily_csv_rows_appended": 0, "daily_csv_values_updated": 0}
         gap_dates: list[str] = []
         upsert_result = None
         gapfill_result = None
@@ -336,6 +337,10 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
                         "AP monthly arrival totals were not updated because monthly source rows are missing: %s",
                         ", ".join(missing_months),
                     )
+                csv_result = history_store.sync_daily_price_csv_from_graph(
+                    set(combined) | set(gap_dates))
+                ingestion["daily_csv_rows_appended"] = csv_result["rows_appended"]
+                ingestion["daily_csv_values_updated"] = csv_result["values_updated"]
             corrections_written = 0
             for state, entry in all_corrections:
                 line = {"ingested_utc": entry["ingested_utc"], "state": state, "date": entry["date"],
@@ -353,6 +358,8 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
                 unchanged=ingestion["unchanged"], latest_observation=latest,
                 message=f"{len(successful)}/{len(args.states)} states ok; "
                         f"corrections_logged={corrections_written}; gap_filled={ingestion['gap_filled']}; "
+                        f"daily_csv_rows_appended={ingestion['daily_csv_rows_appended']}; "
+                        f"daily_csv_values_updated={ingestion['daily_csv_values_updated']}; "
                         f"graph_daily_rows_inserted={graph_result['rows_inserted'] if graph_result else 0}; "
                         f"graph_monthly_arrivals_updated="
                         f"{graph_result['monthly_arrivals_updated'] if graph_result else 0}; "
